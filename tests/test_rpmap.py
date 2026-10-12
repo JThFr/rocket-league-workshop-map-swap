@@ -11,6 +11,7 @@ import http.client
 import importlib.util
 import json
 import os
+import struct
 import tempfile
 import threading
 import unittest
@@ -25,6 +26,12 @@ rpmap = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rpmap)
 
 SLOT_FILE = rpmap.SLOTS["underpass"][0]
+PACKAGE_TAG = 0x9E2A83C1
+
+
+def _package(licensee: int) -> bytes:
+    """Minimal bytes that look like a cooked UE3 package header."""
+    return struct.pack("<IHH", PACKAGE_TAG, 868, licensee) + b"\x00" * 32
 
 
 def setUpModule() -> None:
@@ -105,6 +112,28 @@ class SlotTests(_CookedFixture):
         self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "custom")
         with self.assertRaises(RuntimeError):
             rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+
+    def test_stock_slot_without_backup_is_recognised(self):
+        # The default slot (Utopia) usually has no backup yet; the game file's
+        # package header must still identify it as stock, not "unknown".
+        (self.cooked / SLOT_FILE).write_bytes(_package(34))
+        st = rpmap.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["state"], "stock")
+        self.assertFalse(st["backup_exists"])
+        self.assertTrue(st["inferred"])
+
+    def test_swapped_slot_without_backup_is_custom(self):
+        # A licensee-0 cook is a community map, even when it isn't in the list.
+        (self.cooked / SLOT_FILE).write_bytes(_package(0))
+        st = rpmap.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["state"], "custom")
+        self.assertIsNone(st["map_name"])
+        with self.assertRaises(RuntimeError):   # must not back up a custom map as stock
+            rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+
+    def test_garbage_slot_file_stays_unknown(self):
+        (self.cooked / SLOT_FILE).write_bytes(b"not a UE3 package")
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "unknown")
 
     def test_file_hash_matches_for_identical_bytes(self):
         a = self.cooked / "mods" / "TestMap.upk"
