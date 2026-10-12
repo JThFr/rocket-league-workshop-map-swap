@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import rpmap_config as config
 import rpmap_doctor as doctor
+import rpmap_lan as lan
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -38,6 +39,12 @@ PACKAGE_TAG = 0x9E2A83C1
 def _package(licensee: int) -> bytes:
     """Minimal bytes that look like a cooked UE3 package header."""
     return struct.pack("<IHH", PACKAGE_TAG, 868, licensee) + b"\x00" * 32
+
+
+def _lan_msg(class_name: str, payload: bytes) -> bytes:
+    """A synthetic 14001 datagram: [uint32 BE name length][name][0x00][JSON]."""
+    name = class_name.encode()
+    return struct.pack(">I", len(name)) + name + b"\x00" + payload
 
 
 def setUpModule() -> None:
@@ -229,6 +236,86 @@ class PeerTests(unittest.TestCase):
 
     def test_common_map_keys_ignores_peers_without_inventory(self):
         self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
+
+
+class LanRelayTests(unittest.TestCase):
+    """The native LAN discovery relay core (`docs/rl-lan-relay.md`)."""
+
+    QUERY = _lan_msg(
+        "ProjectX.LanMessage_HostQuery_X",
+        b'{"BuildID":-1846618557,"bHost":false,"Nonce":4288142294}')
+    RESPONSE = _lan_msg(
+        "ProjectX.LanMessage_HostResponse_X",
+        b'{"Result":{},"ServerID":"192.168.1.16:7777",'
+        b'"MetaData":"{}","Nonce":4288142294}')
+
+    def test_classify_query_and_response(self):
+        self.assertEqual(lan.classify(self.QUERY)[0], "query")
+        self.assertEqual(lan.classify(self.RESPONSE)[0], "response")
+
+    def test_classify_ignores_other_packets(self):
+        self.assertIsNone(lan.classify(b"")[0])
+        self.assertIsNone(lan.classify(b"\xff\xff\xff\xff\x00")[0])
+        self.assertIsNone(lan.classify(b"\x00\x00\x00\x02hi")[0])
+
+    def test_rewrite_grows_the_json_and_keeps_the_frame(self):
+        new, old, addr = lan.rewrite_serverid(self.RESPONSE, "100.108.219.85")
+        self.assertEqual(old, "192.168.1.16:7777")
+        self.assertEqual(addr, "100.108.219.85:7777")
+        self.assertIn(b'"ServerID":"100.108.219.85:7777"', new)
+        # the class-name length prefix must not move
+        n_old = int.from_bytes(self.RESPONSE[:4], "big")
+        n_new = int.from_bytes(new[:4], "big")
+        self.assertEqual(new[:4 + n_new], self.RESPONSE[:4 + n_old])
+        self.assertGreater(len(new), len(self.RESPONSE))
+        self.assertEqual(lan.classify(new)[0], "response")   # still a response
+
+    def test_rewrite_without_serverid_is_none(self):
+        self.assertIsNone(lan.rewrite_serverid(self.QUERY, "100.108.219.85"))
+
+    def test_rewrite_preserves_the_port(self):
+        msg = _lan_msg("ProjectX.LanMessage_HostResponse_X",
+                       b'{"ServerID":"10.0.0.5:12345"}')
+        self.assertEqual(lan.rewrite_serverid(msg, "100.0.0.1")[2], "100.0.0.1:12345")
+
+    def test_nonce_is_extracted(self):
+        self.assertEqual(lan.extract_nonce(self.RESPONSE), "4288142294")
+
+    def test_relay_framing_roundtrip(self):
+        pkt = lan.encode("s3cr3t", lan.TYPE_Q, self.QUERY)
+        self.assertEqual(lan.decode("s3cr3t", pkt), (lan.TYPE_Q, self.QUERY))
+
+    def test_relay_framing_rejects_bad_token_and_magic(self):
+        self.assertEqual(lan.decode("other", lan.encode("s3cr3t", lan.TYPE_R, b"x")),
+                         (None, None))
+        self.assertEqual(lan.decode("s3cr3t", b"NOPE" + b"s3cr3t\x00R"), (None, None))
+
+    def test_source_gate_is_tailnet_only(self):
+        self.assertTrue(lan.source_allowed("127.0.0.1"))
+        self.assertTrue(lan.source_allowed("100.108.219.85"))
+        self.assertFalse(lan.source_allowed("192.168.1.16"))
+        self.assertFalse(lan.source_allowed("203.0.113.9"))
+        self.assertFalse(lan.source_allowed("not-an-ip"))
+        self.assertTrue(lan.source_allowed("192.168.1.16", dev=True))
+
+    def test_resolve_peers_prefers_explicit(self):
+        self.assertEqual(lan.resolve_peers({}, ["100.0.0.2", " "]), ["100.0.0.2"])
+
+    def test_resolve_peers_falls_back_to_online_tailnet_peers(self):
+        orig = lan.tailscale_peers
+        lan.tailscale_peers = lambda cfg=None: [
+            {"name": "up", "ip": "100.0.0.2", "online": True},
+            {"name": "down", "ip": "100.0.0.3", "online": False}]
+        try:
+            self.assertEqual(lan.resolve_peers({}, []), ["100.0.0.2"])
+        finally:
+            lan.tailscale_peers = orig
+
+    def test_dedupe_drops_exact_repeats(self):
+        seen = lan._Seen()
+        self.assertTrue(seen.fresh(b"abc"))
+        self.assertFalse(seen.fresh(b"abc"))
+        self.assertTrue(seen.fresh(b"def"))
 
 
 class SyncTargetTests(_CookedFixture):

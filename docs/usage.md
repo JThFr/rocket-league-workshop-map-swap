@@ -41,6 +41,8 @@ stop it without a terminal. This matters after a **self-update**, when the app r
 | `python3 rpmap.py fetch <host> [port]` | download the host's map and stage it |
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
 | `python3 rpmap.py serve [--host H --port P] [--restore-on-exit]` | run the web UI / peer server |
+| `python3 rpmap.py lan-host [--peer IP]...` | relay native LAN discovery (you host the LAN match) |
+| `python3 rpmap.py lan-join --host IP` | receive relayed native LAN discovery (you join) |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
 | `python3 rpmap.py stop` | stop a running web UI (same as its Quit button) |
 | `python3 rpmap.py doctor` | diagnose the setup (game path, slot, Tailscale, peers, TLS, window) |
@@ -113,6 +115,35 @@ Design notes: [`rpmap-phase2.md`](rpmap-phase2.md).
 The **Players** panel labels a tailnet node that isn't usable: *offline*, *online · not rpmap*
 (Tailscale is up there but rpmap isn't running / isn't bound to the tailnet), or *rpmap · no map
 list* (an older build). "In sync" counts only the reachable rpmap peers.
+
+## Native LAN discovery over Tailscale
+
+Rocket League's **Create LAN / Join LAN** list uses a broadcast the game sends to
+`255.255.255.255:14001`, which never leaves the local network — so tailnet peers don't see each
+other's lobbies. `rpmap` can **relay** that discovery between tailnet peers, giving you the
+in-game lobby browser without BakkesMod/Rocket Plugin:
+
+```bash
+# on the machine hosting the LAN match
+python3 rpmap.py lan-host
+# on every joiner (host's tailnet IP)
+python3 rpmap.py lan-join --host 100.x.y.z
+```
+
+Then: the host **creates a LAN match**; each joiner opens the **Join LAN / local lobby** list, the
+host's lobby appears, and clicking it **connects directly to the host's `100.x:7777`** over
+Tailscale. Only the discovery is relayed — the match itself is a normal Tailscale connection.
+
+- The shared **session code** is the relay token by default (`~/.config/rpmap/config.json`, or
+  `rpmap session`), so both sides just need the same code; `--token` overrides.
+- `lan-host` targets **all online tailnet peers** by default (`--peer <ip>` to restrict).
+- The relay binds to this machine's **tailnet IP** and drops packets from non-tailnet sources;
+  `--bind`, `--relay-port` (default `14002`), `--inject broadcast|loopback`, `--lan-port`
+  (default `14001`) and `--advertise <ip>` (host: the address written into the lobby reply) are
+  available when needed.
+- Keep **no-EAC** launches, as with any mod-adjacent tooling.
+- The relay was validated in-game Linux→Windows; design and the latency notes (prefer a
+  **direct** tailnet path over a DERP relay) are in the parent project's `docs/rl-lan-relay.md`.
 
 ## Troubleshooting
 
