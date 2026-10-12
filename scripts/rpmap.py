@@ -175,14 +175,15 @@ def _update_asset_name() -> str:
 def _update_target() -> tuple[Path, str] | None:
     """(path to replace, kind) for the running build, or None if not packaged.
 
-    ``kind`` is ``"exe"`` (Windows - needs the helper swap) or ``"file"``
-    (Linux binary / AppImage - can be replaced in place).
+    ``kind`` is ``"exe"`` (Windows), ``"appimage"`` (a FUSE mount point, so it
+    must be swapped after this process exits) or ``"file"`` (a plain Linux
+    binary, which can be replaced in place).
     """
     if os.name == "nt":
         return (Path(sys.executable), "exe") if _is_frozen() else None
     appimage = os.environ.get("APPIMAGE")
     if appimage and Path(appimage).is_file():
-        return (Path(appimage), "file")
+        return (Path(appimage), "appimage")
     return (Path(sys.executable), "file") if _is_frozen() else None
 
 
@@ -270,6 +271,33 @@ def _spawn_windows_swap(new_exe: Path, current_exe: Path) -> None:
                      creationflags=detached | new_group)
 
 
+def _spawn_posix_swap(new_file: Path, target: Path) -> None:
+    """Detached shell that swaps the AppImage once we exit, then relaunches.
+
+    A running AppImage is a FUSE mount point, so ``mv`` over it fails until the
+    process exits and unmounts - hence the retry loop.
+    """
+    script = Path(tempfile.gettempdir()) / "rpmap-update.sh"
+    lines = [
+        "#!/bin/sh",
+        "n=0",
+        f'while ! mv -f "{new_file}" "{target}" 2>/dev/null; do',
+        "  n=$((n+1))",
+        "  [ $n -ge 120 ] && exit 1",
+        "  sleep 1",
+        "done",
+        f'chmod +x "{target}"',
+        f'nohup "{target}" >/dev/null 2>&1 &',
+        'rm -f "$0"',
+        "",
+    ]
+    script.write_text("\n".join(lines))
+    os.chmod(script, 0o755)
+    subprocess.Popen(["/bin/sh", str(script)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def apply_update(info: dict) -> None:
     """Download and install a newer build, then restart. Only for packaged builds."""
     url = info.get("url")
@@ -287,7 +315,11 @@ def apply_update(info: dict) -> None:
         _spawn_windows_swap(staged, path)
         print(f"rpmap: updating to {info.get('version')} - restarting...", flush=True)
         os._exit(0)
-    try:                       # POSIX can replace the running file in place
+    if kind == "appimage":
+        _spawn_posix_swap(staged, path)
+        print(f"rpmap: updating to {info.get('version')} - restarting...", flush=True)
+        os._exit(0)
+    try:                       # plain Linux binary: replace the running file in place
         os.chmod(staged, 0o755)
         os.replace(staged, path)
     except OSError as e:
@@ -1374,7 +1406,10 @@ def make_handler(engine: dict):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # browser navigated away / closed the tab mid-response
 
         def _json(self, obj, code=200):
             self._send(json.dumps(obj).encode(), "application/json", code)
@@ -1507,6 +1542,41 @@ def _find_port(preferred: int) -> int:
     return preferred
 
 
+class _HttpServer(ThreadingHTTPServer):
+    """Threaded HTTP server that stays quiet when a client just goes away."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def _open_browser(url: str) -> None:
+    """Open ``url`` in the default browser.
+
+    PyInstaller puts its bundled libs on ``LD_LIBRARY_PATH``; if a desktop
+    opener (kde-open/xdg-open) inherits that it can pick up a bundled libssl
+    that clashes with the system libcurl. So launch the opener ourselves with a
+    cleaned environment on Linux.
+    """
+    if os.name != "nt":
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
+        opener = shutil.which("xdg-open") or shutil.which("kde-open5") or shutil.which("kde-open")
+        if opener:
+            try:
+                subprocess.Popen([opener, url], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+    webbrowser.open(url)
+
+
 def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool,
                secret: str | None = None, dev: bool = False) -> int:
     cfg = load_config()
@@ -1520,12 +1590,12 @@ def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool
     ident = local_identity(cfg)
     token = secrets.token_urlsafe(16)
     actual = _find_port(port) if host == "127.0.0.1" else port
-    httpd = ThreadingHTTPServer((host, actual),
-                                make_handler({"cooked": cooked, "slot": slot,
-                                              "token": token, "host": host,
-                                              "secret": cfg["session_secret"],
-                                              "cfg": cfg, "ident": ident,
-                                              "dev": dev, "port": actual}))
+    httpd = _HttpServer((host, actual),
+                        make_handler({"cooked": cooked, "slot": slot,
+                                      "token": token, "host": host,
+                                      "secret": cfg["session_secret"],
+                                      "cfg": cfg, "ident": ident,
+                                      "dev": dev, "port": actual}))
     url = f"http://127.0.0.1:{actual}/?token={token}"
     print(f"rpmap UI  ->  {url}", flush=True)
     print(f"slot: {SLOTS[slot][0]}   cooked: {cooked}", flush=True)
@@ -1536,7 +1606,7 @@ def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool
     else:
         print(f"note: bound to {host}; peers reach this on port {actual}", flush=True)
     if open_browser:
-        threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
+        threading.Thread(target=lambda: _open_browser(url), daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

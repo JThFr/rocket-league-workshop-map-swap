@@ -66,6 +66,25 @@ class VersionTests(unittest.TestCase):
         self.assertRegex(rpmap.new_secret(), r"^[0-9a-f]{4}(-[0-9a-f]{4}){3}$")
 
 
+class UpdateTests(unittest.TestCase):
+    def setUp(self):
+        self._appimage = os.environ.pop("APPIMAGE", None)
+
+    def tearDown(self):
+        if self._appimage is None:
+            os.environ.pop("APPIMAGE", None)
+        else:
+            os.environ["APPIMAGE"] = self._appimage
+
+    def test_appimage_env_selects_deferred_swap(self):
+        with tempfile.NamedTemporaryFile(suffix=".AppImage") as f:
+            os.environ["APPIMAGE"] = f.name
+            self.assertEqual(rpmap._update_target(), (Path(f.name), "appimage"))
+
+    def test_no_target_when_running_from_source(self):
+        self.assertIsNone(rpmap._update_target())
+
+
 class SlotTests(_CookedFixture):
     def test_slot_reports_stock_when_backup_matches(self):
         (self.cooked / (SLOT_FILE + ".orig")).write_bytes(b"STOCK")
