@@ -55,6 +55,7 @@ import secrets
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -665,6 +666,28 @@ def _slot_paths(cooked: Path, slot: str) -> tuple[Path, Path, Path]:
             cooked / SLOTS[slot][1])
 
 
+# A cooked UE3 package starts with this tag, then uint16 version, uint16
+# licensee version. Rocket League's own content is cooked with a nonzero
+# licensee version (34, or 32 for a few helper packages); community maps built
+# with the RL SDK/UDK are cooked with licensee version 0. That difference lets
+# us tell a stock slot file from a swapped-in map even before a stock backup
+# has been taken.
+UE3_PACKAGE_TAG = 0x9E2A83C1
+
+
+def _package_licensee_version(path: Path) -> int | None:
+    """Licensee version from a package header, or None if this isn't a package."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if len(head) < 8:
+        return None
+    tag, _version, licensee = struct.unpack("<IHH", head)
+    return licensee if tag == UE3_PACKAGE_TAG else None
+
+
 def _effective_backup(backup: Path, alt: Path) -> Path | None:
     if backup.is_file():
         return backup
@@ -682,7 +705,7 @@ def slot_state(cooked: Path, slot: str = DEFAULT_SLOT) -> dict:
         "slot_file": str(slot_file), "exists": slot_file.is_file(),
         "state": "missing", "map_name": None, "map_id": None, "size": 0, "modified": None,
         "backup_exists": bool(eff), "backup_path": str(eff) if eff else None,
-        "sha256": None, "workshop_id": None,
+        "sha256": None, "workshop_id": None, "inferred": False,
     }
     if not slot_file.is_file():
         return state
@@ -706,6 +729,14 @@ def slot_state(cooked: Path, slot: str = DEFAULT_SLOT) -> dict:
             state["map_id"] = m["id"]
             state["workshop_id"] = m.get("workshop_id")
             return state
+
+    # No matching backup and no known map file. Read the package header: the
+    # game's own files carry a nonzero licensee version, community maps 0.
+    licensee = _package_licensee_version(slot_file)
+    if licensee is not None:
+        state["state"] = "stock" if licensee != 0 else "custom"
+        state["inferred"] = True
+        return state
 
     state["state"] = "unknown"
     return state
@@ -1215,7 +1246,8 @@ function render(){
   hero.className = 'hero is-' + s.state;
   const name = s.map_name ? s.map_name
              : (s.state==='stock' ? 'Stock map'
-             : (s.state==='missing' ? 'Slot file missing' : 'Unknown map'));
+             : (s.state==='missing' ? 'Slot file missing'
+             : (s.state==='custom' ? 'Custom map' : 'Unknown map')));
   document.getElementById('currentName').textContent = name;
 
   const labels = {stock:'stock map', custom:'custom map', unknown:'unrecognised', missing:'no slot file'};
