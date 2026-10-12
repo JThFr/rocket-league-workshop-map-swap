@@ -66,6 +66,25 @@ class VersionTests(unittest.TestCase):
         self.assertRegex(rpmap.new_secret(), r"^[0-9a-f]{4}(-[0-9a-f]{4}){3}$")
 
 
+class UpdateTests(unittest.TestCase):
+    def setUp(self):
+        self._appimage = os.environ.pop("APPIMAGE", None)
+
+    def tearDown(self):
+        if self._appimage is None:
+            os.environ.pop("APPIMAGE", None)
+        else:
+            os.environ["APPIMAGE"] = self._appimage
+
+    def test_appimage_env_selects_deferred_swap(self):
+        with tempfile.NamedTemporaryFile(suffix=".AppImage") as f:
+            os.environ["APPIMAGE"] = f.name
+            self.assertEqual(rpmap._update_target(), (Path(f.name), "appimage"))
+
+    def test_no_target_when_running_from_source(self):
+        self.assertIsNone(rpmap._update_target())
+
+
 class SlotTests(_CookedFixture):
     def test_slot_reports_stock_when_backup_matches(self):
         (self.cooked / (SLOT_FILE + ".orig")).write_bytes(b"STOCK")
@@ -92,6 +111,24 @@ class SlotTests(_CookedFixture):
         b = self.cooked / "mods" / "Copy.upk"
         b.write_bytes(a.read_bytes())
         self.assertEqual(rpmap.file_hash(a), rpmap.file_hash(b))
+
+    def test_slot_state_reports_arena_name(self):
+        st = rpmap.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["arena"], "Underpass")
+        self.assertEqual(st["note"], 'NOT "Tokyo Underpass"')
+        self.assertEqual(rpmap.slot_state(self.cooked, "utopia")["arena"], "Utopia Retro")
+
+
+class RestoreOnExitTests(_CookedFixture):
+    def test_restores_a_swapped_slot(self):
+        rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "custom")
+        rpmap._restore_on_exit(self.cooked, "underpass")
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "stock")
+
+    def test_is_a_noop_without_a_backup(self):
+        rpmap._restore_on_exit(self.cooked, "underpass")   # must not raise
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "unknown")
 
 
 class MapsTests(_CookedFixture):

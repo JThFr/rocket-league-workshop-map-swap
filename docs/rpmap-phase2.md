@@ -18,7 +18,7 @@ below for the original transfer design (not used).
 While a group is connected over Tailscale, each `rpmap.py` instance should be able to:
 
 1. **See the other players** (peers on the tailnet).
-2. **Show what map each peer has loaded** in their Underpass slot.
+2. **Show what map each peer has loaded** in their slot.
 3. **Confirm everyone is in sync** (same map content, by hash — not just the same name).
 4. **Propagate a switch** (optional): when someone picks a map, the others fetch it (if they
    don't have it) and swap to the same map, so a session can move maps without coordinating
@@ -138,6 +138,7 @@ Display per peer: `same` / `different` / `unknown` (peer unreachable or hash mis
 - Ports: Rocket Plugin file server = **TCP 7777**; `rpmap.py` UI = **8787**.
 - `tailscale status --json` needs `tailscaled` running (`sudo systemctl start tailscaled`);
   the socket may require root depending on the install.
-- Slot file: `CookedPCConsole/Labs_Underpass_P.upk`; backup: `…upk.orig`.
-- Swap rules: pick arena **"Underpass"**, not "Tokyo Underpass"; same file on every player;
-  restore before online play.
+- Slot file (default): `CookedPCConsole/Labs_Utopia_P.upk` (arena **Utopia Retro**); backup
+  `…upk.orig`. `--slot underpass` uses `Labs_Underpass_P.upk` (Rumble) instead.
+- Swap rules: pick the slot's arena in Free Play; same file on every player; restore before
+  online play (or run `serve --restore-on-exit`).

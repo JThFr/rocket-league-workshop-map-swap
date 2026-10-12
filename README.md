@@ -24,10 +24,11 @@ in the way, and this tool exists to smooth them out:
 
 ## What it does
 
-1. **Slot swap (no restart).** Rocket League loads the stock `Labs_Underpass_P.upk` whenever
-   you pick the arena **Underpass** (not "Tokyo Underpass"). Overwrite that one file and the
-   game loads your map — no plugin, no restart. `rpmap` backs up the stock file and swaps
-   maps in and out.
+1. **Slot swap (no restart).** Rocket League loads a stock arena package whenever you pick
+   that arena. Overwrite that one file and the game loads your map — no plugin, no restart.
+   The default slot is **Utopia Retro** (`Labs_Utopia_P.upk`), which isn't used in any online
+   playlist; **Underpass** (`Labs_Underpass_P.upk`, used in Rumble) is also available via
+   `--slot underpass`. `rpmap` backs up the stock file and swaps maps in and out.
 2. **Rocket Plugin staging.** Copy maps into `CookedPCConsole/{mods,rocketplugin}` so Rocket
    Plugin sees them without its "Copy Map and Restart" step.
 3. **Peer sync (reference-only).** Peers on a Tailscale tailnet see what map each other has
@@ -58,13 +59,16 @@ configuration, updates, and how to build the binaries — is documented in
 
 ## The swap, and the rules
 
-- Pick the arena **"Underpass"** in Free Play / Custom Games — **not** "Tokyo Underpass".
-  They are different packages (`Labs_Underpass_P.upk` vs `Labs_Underpass_v0_p.upk`).
+- In Free Play / Custom Games, pick the arena that matches your **slot**. The default is
+  **Utopia Retro** (not used in online playlists); `--slot underpass` uses **Underpass**
+  (which **is** used in Rumble — not "Tokyo Underpass").
 - Keep the **same map file on every player** (a mismatch = content mismatch / crash).
-- **Restore the stock map before playing online** — Rumble uses Underpass. The UI's
-  "Restore stock Underpass" button does this.
-- The stock map is backed up next to the slot as `Labs_Underpass_P.upk.orig`; the tools also
-  recognise the `ORIGINAL_UNDERPASS.upk` name other loaders use.
+- **Restore the stock map before playing online** if your slot arena is one that online uses
+  (Underpass is; Utopia Retro isn't — but Arcade/LTM rotates Rocket Labs arenas). The UI's
+  "Restore stock map" button does this, and `--restore-on-exit` does it automatically when you
+  quit.
+- The stock map is backed up next to the slot (e.g. `Labs_Utopia_P.upk.orig`); the tools also
+  recognise the `ORIGINAL_*.upk` names other loaders use.
 - A pure file swap is not injection, but Rocket League mods generally want a **no-EAC
   launch** — safe default.
 

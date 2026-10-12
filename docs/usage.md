@@ -28,13 +28,25 @@ scripts/rpmap list
 | `python3 rpmap.py status <host> [port]` | ask a Rocket Plugin host what map it serves |
 | `python3 rpmap.py fetch <host> [port]` | download the host's map and stage it |
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
-| `python3 rpmap.py serve [--host H --port P]` | run the web UI / peer server |
+| `python3 rpmap.py serve [--host H --port P] [--restore-on-exit]` | run the web UI / peer server |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
 | `python3 rpmap.py version` | print the version |
 | `python3 rpmap.py check-update` | check GitHub for a newer release |
 
 Global options: `--cooked <path>` (override the game's `CookedPCConsole`), `--slot <name>`,
-`--no-update-check`.
+`--no-update-check`, `--restore-on-exit`.
+
+### Slot & arena
+
+`--slot` picks which stock arena package gets overwritten, and which arena you select in Free
+Play:
+
+- `utopia` (**default**) → `Labs_Utopia_P.upk` (arena **Utopia Retro**) — not in online playlists
+- `underpass` → `Labs_Underpass_P.upk` (arena **Underpass**) — used in Rumble; not "Tokyo Underpass"
+
+`--restore-on-exit` is a global flag (so it also works with the no-argument UI launch, e.g.
+`./rpmap-x86_64.AppImage --restore-on-exit`) and puts the stock map back when the program exits
+cleanly (Ctrl+C, or closing the terminal). The UI's "Restore stock map" button does it on demand.
 
 ## Web UI
 
