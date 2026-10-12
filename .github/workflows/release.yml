@@ -52,3 +52,26 @@ jobs:
           name: v${{ needs.prepare.outputs.version }}
           generate_release_notes: true
           files: dist/*
+
+  # Housekeeping: keep only the newest KEEP releases (old assets add up ~32 MB
+  # each). The git tags are left alone, so version history and rollback links
+  # survive - only the release + its assets go.
+  prune:
+    needs: [prepare, release]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KEEP: "10"
+    steps:
+      - name: Delete all but the newest releases
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(gh release list --limit 200 \
+            --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+          echo "keeping the newest $KEEP of ${#tags[@]} release(s)"
+          for tag in "${tags[@]:$KEEP}"; do
+            echo "pruning $tag"
+            gh release delete "$tag" --yes
+          done
