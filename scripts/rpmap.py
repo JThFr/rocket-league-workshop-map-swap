@@ -16,8 +16,8 @@ Two independent jobs:
      Plugin sees them without its "Copy Map and Restart" step.
 
 Usage:
-  python3 rpmap.py                      # visual interface (local web UI)
-  python3 rpmap.py serve [--host H --port P] [--no-browser] [--secret CODE]
+  python3 rpmap.py                      # status window + visual interface (web UI)
+  python3 rpmap.py serve [--host H --port P] [--no-browser] [--no-window] [--secret CODE]
   python3 rpmap.py list                 # candidate maps (workshop/mods/~/maps)
   python3 rpmap.py current [--slot s]   # what is loaded in the slot
   python3 rpmap.py use <name|path>      # swap a map into the slot (backs up first)
@@ -89,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--slot", default=DEFAULT_SLOT, choices=sorted(SLOTS))
     ap.add_argument("--no-update-check", action="store_true",
                     help="skip the startup check for a newer GitHub release")
+    ap.add_argument("--no-window", dest="no_window", action="store_true",
+                    help="don't show the desktop status window")
     ap.add_argument("--restore-on-exit", dest="restore_on_exit", action="store_true",
                     help="restore the stock map when the program exits cleanly")
     sub = ap.add_subparsers(dest="cmd")
@@ -115,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="also accept private-LAN peers (testing without Tailscale)")
     p_srv.add_argument("--restore-on-exit", dest="restore_on_exit_serve", action="store_true",
                        help="restore the stock map when the program exits cleanly")
+    p_srv.add_argument("--no-window", dest="no_window_serve", action="store_true",
+                       help="don't show the desktop status window")
     sub.add_parser("peers", help="show tailnet peers and their loaded maps")
     p_ss = sub.add_parser("session", help="show or rotate the shared session code")
     p_ss.add_argument("--new", action="store_true", help="generate a new code")
@@ -197,7 +201,9 @@ def main(argv: list[str] | None = None) -> int:
                           secret=getattr(args, "secret", None),
                           dev=getattr(args, "dev", False),
                           restore_on_exit=(getattr(args, "restore_on_exit_serve", False)
-                                           or getattr(args, "restore_on_exit", False)))
+                                           or getattr(args, "restore_on_exit", False)),
+                          window=(not getattr(args, "no_window_serve", False)
+                                  and not getattr(args, "no_window", False)))
 
     if args.cmd == "list":
         for m in list_maps(cooked):

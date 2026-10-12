@@ -28,6 +28,7 @@ import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
 import rpmap_web as web
+import rpmap_window as window
 
 SLOT_FILE = config.SLOTS["underpass"][0]
 PACKAGE_TAG = 0x9E2A83C1
@@ -459,6 +460,23 @@ class RuntimeFileTests(unittest.TestCase):
         self.assertFalse(config.pid_alive(10_000_000))
 
 
+class WindowTests(unittest.TestCase):
+    """The status window is best-effort: never import- or runtime-fatal."""
+
+    def test_available_returns_a_bool(self):
+        self.assertIsInstance(window.available(), bool)
+
+    def test_no_window_without_a_display(self):
+        if os.name == "nt":
+            self.skipTest("the DISPLAY check is POSIX-only")
+        old = os.environ.pop("DISPLAY", None)
+        try:
+            self.assertFalse(window.available())
+        finally:
+            if old is not None:
+                os.environ["DISPLAY"] = old
+
+
 def _free_port() -> int:
     import socket
     with socket.socket() as s:
@@ -478,7 +496,7 @@ class ServerLifecycleTests(_CookedFixture):
             thread = threading.Thread(
                 target=web.run_server,
                 args=(self.cooked, "underpass", "127.0.0.1", port, False),
-                kwargs={"secret": "s3cr3t"}, daemon=True)
+                kwargs={"secret": "s3cr3t", "window": False}, daemon=True)
             thread.start()
 
             rec = {}

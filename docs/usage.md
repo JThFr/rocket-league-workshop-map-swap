@@ -6,7 +6,7 @@ for it; on Windows run `python rpmap.py <command>` — the arguments are identic
 ## Run it
 
 ```bash
-python3 rpmap.py                 # visual interface (opens a local web UI in your browser)
+python3 rpmap.py                 # status window + local web UI in your browser
 ```
 
 On Linux the launcher form works too:
@@ -14,6 +14,18 @@ On Linux the launcher form works too:
 ```bash
 scripts/rpmap list
 ```
+
+### The status window
+
+Alongside the web UI, rpmap shows a small **status window** — "rpmap is running", the current
+slot, and **Open UI** / **Restore stock** / **Quit** buttons — so you can always see it's up and
+stop it without a terminal. This matters after a **self-update**, when the app relaunches
+**detached** (no terminal, no Ctrl+C).
+
+- `--no-window` disables it (e.g. a headless/peer-only server).
+- It needs Tk + a display. Packaged builds (AppImage / `.exe`) bundle Tcl/Tk, so it always works
+  there. Running from **source**, your Python needs `tkinter` (Debian/Ubuntu: `python3-tk`,
+  Fedora: `python3-tkinter`); if it's missing, rpmap just runs **headless** — no error.
 
 ## Commands
 
@@ -35,7 +47,7 @@ scripts/rpmap list
 | `python3 rpmap.py check-update` | check GitHub for a newer release |
 
 Global options: `--cooked <path>` (override the game's `CookedPCConsole`), `--slot <name>`,
-`--no-update-check`, `--restore-on-exit`.
+`--no-update-check`, `--no-window`, `--restore-on-exit`.
 
 ### Slot & arena
 
@@ -56,8 +68,9 @@ terminal. The UI's "Restore stock map" button does it on demand.
 browse maps, see the current slot, swap/restore, and (over Tailscale) view peers and sync
 switches. It prints a URL with a token.
 
-To stop it, use the header's **Quit** button or run `rpmap stop` from a terminal — handy after a
-self-update, when the AppImage relaunches detached with no terminal to Ctrl+C.
+To stop it, use the header's **Quit** button, the **status window's** Quit button, or run
+`rpmap stop` from a terminal — handy after a self-update, when the AppImage relaunches detached
+with no terminal to Ctrl+C.
 
 Only **one** rpmap UI runs at a time: if you launch it again while one is already up, it reopens
 the running one instead of starting a second server.

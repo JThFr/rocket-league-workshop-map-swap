@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
+import rpmap_window
 from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
                           TAILNET, clear_runtime, load_config, new_secret,
                           pid_alive, read_runtime, save_config, write_runtime)
@@ -698,14 +699,19 @@ def ui_url(rec: dict) -> str:
     return f"http://{_ui_host(rec.get('host'))}:{int(rec['port'])}/?token={rec.get('token') or ''}"
 
 
-def _install_stop_signals() -> None:
+def _install_stop_signals(on_stop=None) -> None:
     """Turn SIGTERM/SIGHUP into a clean shutdown so on-exit work still runs.
 
-    Ctrl+C already raises KeyboardInterrupt; closing the terminal sends SIGHUP,
-    which would otherwise kill the process without running the ``finally``.
+    Without a window, Ctrl+C already raises KeyboardInterrupt and closing the
+    terminal sends SIGHUP (which would otherwise kill the process without
+    running the ``finally``). With a window the main thread is inside Tk's loop,
+    so we run ``on_stop`` (sets the quit event) instead of raising into the GUI.
     """
     def _stop(signum, frame):
-        raise KeyboardInterrupt
+        if on_stop is not None:
+            on_stop()
+        else:
+            raise KeyboardInterrupt
 
     for name in ("SIGTERM", "SIGHUP"):
         sig = getattr(signal, name, None)
@@ -731,7 +737,7 @@ def _restore_on_exit(cooked: Path, slot: str) -> None:
 
 def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
                secret: str | None = None, dev: bool = False,
-               restore_on_exit: bool = False) -> int:
+               restore_on_exit: bool = False, window: bool = True) -> int:
     cfg = load_config()
     if secret:
         cfg["session_secret"] = secret
@@ -747,7 +753,6 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
               "secret": cfg["session_secret"], "cfg": cfg, "ident": ident,
               "dev": dev, "port": actual}
     httpd = _HttpServer((host, actual), make_handler(engine))
-    engine["request_quit"] = httpd.shutdown          # POST /api/quit -> stop cleanly
     write_runtime({"pid": os.getpid(), "port": actual, "host": host,
                    "token": token, "version": APP_VERSION,
                    "started": int(time.time())})
@@ -760,18 +765,73 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
         print("hint: for peer sync run:  serve --host <tailscale-ip>", flush=True)
     else:
         print(f"note: bound to {host}; peers reach this on port {actual}", flush=True)
-    print("quit:  the UI's Quit button, or `rpmap stop`", flush=True)
+    print("quit:  the UI's Quit button, the status window, or `rpmap stop`", flush=True)
     if auto_open:
         threading.Thread(target=lambda: open_browser(url), daemon=True).start()
-    _install_stop_signals()
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        clear_runtime(os.getpid())
-        if restore_on_exit:
-            _restore_on_exit(cooked, slot)
-        httpd.server_close()
-        print("bye", flush=True)
+
+    if window and rpmap_window.available():
+        _run_with_window(cooked, slot, httpd, engine, url)
+    else:
+        engine["request_quit"] = httpd.shutdown
+        _install_stop_signals()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+    clear_runtime(os.getpid())
+    if restore_on_exit:
+        _restore_on_exit(cooked, slot)
+    httpd.server_close()
+    print("bye", flush=True)
     return 0
+
+
+def _run_with_window(cooked: Path, slot: str, httpd, engine: dict, url: str) -> None:
+    """Serve from a background thread while the status window owns the main one.
+
+    Tk must run its loop in the main thread, so the HTTP server moves to a
+    daemon thread. ``_shutdown`` is the single quit entry point (window button,
+    the window's close button, ``/api/quit`` or a signal): it stops the server
+    and tells the window to close. Cleanup happens in the caller.
+    """
+    quit_event = threading.Event()
+
+    def _shutdown():
+        httpd.shutdown()
+        quit_event.set()
+
+    def _status() -> tuple[str, str]:
+        st = slot_state(cooked, slot)
+        arena = SLOT_INFO.get(slot, {}).get("arena", slot)
+        if st["state"] == "stock":
+            what = "stock map"
+        elif st.get("map_name"):
+            what = st["map_name"]
+        else:
+            what = {"custom": "custom map", "missing": "slot file missing",
+                    "unknown": "unrecognised map"}.get(st["state"], st["state"])
+        return arena, what
+
+    def _restore() -> None:
+        try:
+            restore_slot(cooked, slot)
+        except Exception as e:
+            print(f"restore failed: {e}", file=sys.stderr, flush=True)
+
+    engine["request_quit"] = _shutdown
+    _install_stop_signals(_shutdown)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    print("window: showing the rpmap status window (use --no-window to skip)", flush=True)
+    try:
+        rpmap_window.run(version=APP_VERSION, status_fn=_status,
+                         on_open=lambda: open_browser(url),
+                         on_restore=_restore, on_quit=_shutdown,
+                         quit_event=quit_event)
+    except Exception as e:
+        print(f"could not show the status window ({e}); server keeps running",
+              file=sys.stderr, flush=True)
+        quit_event.set()
+    httpd.shutdown()                    # idempotent: the loop above already ran
+    server_thread.join(timeout=5)

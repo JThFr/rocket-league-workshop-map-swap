@@ -60,6 +60,10 @@ Everything you run — the visual interface, the full command reference, peer sy
 configuration, updates, and how to build the binaries — is documented in
 **[docs/usage.md](docs/usage.md)**.
 
+Starting it also opens a small **status window** ("rpmap is running", with Open UI / Restore
+stock / Quit) so you can always tell it's up and stop it without a terminal — useful after a
+self-update, which runs the app detached. `--no-window` turns it off.
+
 ## The swap, and the rules
 
 - In Free Play / Custom Games, pick the arena that matches your **slot**. The default is a
