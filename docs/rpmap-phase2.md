@@ -89,7 +89,7 @@ GET  /api/peers               -> {self:{...}, peers:[{peer_id, name, ip, online,
 GET  /api/session             -> {peer_id, name, port, secret}
 POST /api/peer/switch         -> {workshop_id?, name?, sha256?}   (resolve locally, verify, swap)
 POST /api/sync                -> {mode:"push"|"pull", peers:[{ip,port,name}]}
-POST /api/session             -> {secret}  (set/rotate the shared secret)
+POST /api/session             -> {secret}  (set/rotate the shared secret; local only)
 _GET  /api/map?sha256=<sha256> -> raw bytes (NOT implemented — reference-only)_
 ```
 
@@ -105,6 +105,15 @@ Display per peer: `same` / `different` / `unknown` (peer unreachable or hash mis
 - Bind to the tailnet (or `0.0.0.0` reachable only via `tailscale0`); never expose publicly.
 - Shared secret on every call; unknown `Host` rejected (DNS-rebinding guard already present).
 - Only accept a transferred map whose bytes hash to the announced `sha256`.
+- `POST /api/sync` targets are validated against the tailnet roster (incl. `manual_peers`);
+  anything else is refused — the API must never become an arbitrary-request proxy or send the
+  session secret to an unknown host.
+- `POST /api/session` (rotate the shared secret) is local-only, like `/api/quit`; the local
+  gate accepts loopback **and this machine's own tailnet address** (the local browser reaches
+  a tailnet-bound UI from that address).
+- The UI passes ids as data attributes to a delegated listener — never interpolated into
+  generated JS — and every response carries `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`.
 - Never auto-swap during an online match.
 - Keep the existing "restore before online play" rule visible in the UI.
 

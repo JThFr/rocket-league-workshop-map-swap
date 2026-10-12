@@ -13,7 +13,8 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from rpmap_config import APP_VERSION, GITHUB_RELEASES_API, GITHUB_RELEASES_PAGE, PRODUCT
+from rpmap_config import (APP_VERSION, GITHUB_RELEASES_API, GITHUB_RELEASES_PAGE,
+                          GITHUB_REPO, PRODUCT)
 
 
 # --------------------------------------------------------------------------- #
@@ -83,13 +84,41 @@ def check_for_update() -> dict | None:
             "digest": digest, "size": size}
 
 
-def _download_update(url: str, dest: Path, digest: str | None) -> None:
+def _update_refusal(info: dict) -> str | None:
+    """Why this release info must not be auto-installed, or None if it may.
+
+    The download URL must be an official release asset of this repo, and the
+    asset must carry a sha256 digest - the digest is the only integrity check
+    between "GitHub says this is the latest release" and "replace the running
+    executable with these bytes", so an update without one is refused rather
+    than installed unverified.
+    """
+    url = info.get("url")
+    if not isinstance(url, str) or not url.startswith(
+            f"https://github.com/{GITHUB_REPO}/releases/download/"):
+        return "the download URL is not an official release asset"
+    digest = info.get("digest")
+    want = digest.split(":")[-1].lower() if isinstance(digest, str) else ""
+    if not digest or not re.fullmatch(r"[0-9a-f]{64}", want):
+        return "the release asset has no usable sha256 digest"
+    return None
+
+
+def _download_update(url: str, dest: Path, digest: str | None, size: int = 0) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
+    written = 0
     with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
         for chunk in iter(lambda: r.read(1024 * 1024), b""):
             h.update(chunk)
             f.write(chunk)
+            written += len(chunk)
+    if size and written != size:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("downloaded update has the wrong size")
     if digest:
         want = digest.split(":")[-1].lower()
         if want and h.hexdigest().lower() != want:
@@ -126,6 +155,13 @@ def _windows_swap_script(new_exe: Path, current_exe: Path) -> str:
     return "\r\n".join(lines)
 
 
+def _write_windows_swap(new_exe: Path, current_exe: Path, args: list[str]) -> Path:
+    """Write the swap .cmd into a fresh private temp dir; return its path."""
+    cmd = Path(tempfile.mkdtemp(prefix="rpmap-update-")) / "swap.cmd"
+    cmd.write_text(_windows_swap_script(new_exe, current_exe))
+    return cmd
+
+
 def _spawn_windows_swap(new_exe: Path, current_exe: Path, args: list[str]) -> None:
     """Write (and detach) the .cmd that swaps the exe and relaunches it.
 
@@ -133,8 +169,7 @@ def _spawn_windows_swap(new_exe: Path, current_exe: Path, args: list[str]) -> No
     file unlocks, then start the new build. ``ping`` is the delay because
     ``timeout`` needs a console, which a detached process doesn't have.
     """
-    cmd = Path(tempfile.gettempdir()) / "rpmap-update.cmd"
-    cmd.write_text(_windows_swap_script(new_exe, current_exe))
+    cmd = _write_windows_swap(new_exe, current_exe, args)
     detached = 0x00000008          # DETACHED_PROCESS
     new_group = 0x00000200         # CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(["cmd", "/c", str(cmd), *args],
@@ -166,15 +201,21 @@ def _posix_swap_script(new_file: Path, target: Path, args: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _write_posix_swap(new_file: Path, target: Path, args: list[str]) -> Path:
+    """Write the swap script into a fresh private temp dir; return its path."""
+    script = Path(tempfile.mkdtemp(prefix="rpmap-update-")) / "swap.sh"
+    script.write_text(_posix_swap_script(new_file, target, args))
+    os.chmod(script, 0o755)
+    return script
+
+
 def _spawn_posix_swap(new_file: Path, target: Path, args: list[str]) -> None:
     """Write (and detach) the shell script that swaps the file and relaunches.
 
     A running AppImage is a FUSE mount point, so ``mv`` over it fails until the
     process exits and unmounts - hence the retry loop.
     """
-    script = Path(tempfile.gettempdir()) / "rpmap-update.sh"
-    script.write_text(_posix_swap_script(new_file, target, args))
-    os.chmod(script, 0o755)
+    script = _write_posix_swap(new_file, target, args)
     subprocess.Popen(["/bin/sh", str(script)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
@@ -186,10 +227,15 @@ def apply_update(info: dict) -> None:
     target = _update_target()
     if not url or not target:
         return
+    reason = _update_refusal(info)
+    if reason:
+        print(f"rpmap: refusing self-update: {reason}  ->  install it manually "
+              f"from {GITHUB_RELEASES_PAGE}", file=sys.stderr)
+        return
     path, kind = target
     staged = path.with_name(path.name + ".new")
     try:
-        _download_update(url, staged, info.get("digest"))
+        _download_update(url, staged, info.get("digest"), info.get("size"))
     except Exception as e:
         print(f"rpmap: update download failed: {e}", file=sys.stderr)
         return

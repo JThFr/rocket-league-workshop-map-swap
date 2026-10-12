@@ -113,6 +113,80 @@ class UpdateTests(unittest.TestCase):
         script = update._windows_swap_script(Path(r"C:\new.exe"), Path(r"C:\app.exe"))
         self.assertIn('start "" "C:\\app.exe" %*', script)
 
+    def test_refusal_for_foreign_url(self):
+        info = {"url": "https://example.com/rpmap.exe", "digest": "sha256:" + "a" * 64}
+        reason = update._update_refusal(info)
+        self.assertIsNotNone(reason)
+        self.assertIn("official", reason)
+
+    def test_refusal_for_missing_digest(self):
+        info = {"url": f"https://github.com/{config.GITHUB_REPO}/releases/download/"
+                       f"v0.0.0/rpmap.exe", "digest": None}
+        reason = update._update_refusal(info)
+        self.assertIsNotNone(reason)
+        self.assertIn("digest", reason)
+
+    def test_refusal_for_malformed_digest(self):
+        info = {"url": f"https://github.com/{config.GITHUB_REPO}/releases/download/"
+                       f"v0.0.0/rpmap.exe", "digest": "sha256:zz"}
+        reason = update._update_refusal(info)
+        self.assertIsNotNone(reason)
+        self.assertIn("digest", reason)
+
+    def test_no_refusal_for_good_info(self):
+        info = {"url": f"https://github.com/{config.GITHUB_REPO}/releases/download/"
+                       f"v0.0.0/rpmap.exe", "digest": "a" * 64}
+        self.assertIsNone(update._update_refusal(info))
+
+    def test_download_update_checks_size(self):
+        data = b"NEWBUILD"
+        with tempfile.TemporaryDirectory(prefix="rpmap-dl-") as d:
+            src = Path(d) / "new-build"
+            src.write_bytes(data)
+            dest = Path(d) / "dest"
+            update._download_update(f"file://{src}", dest, None, size=len(data))
+            self.assertEqual(dest.read_bytes(), data)
+            with self.assertRaises(RuntimeError):
+                update._download_update(f"file://{src}", dest, None, size=len(data) + 1)
+            self.assertFalse(dest.exists())
+
+    def test_download_update_checks_digest(self):
+        import hashlib
+        data = b"NEWBUILD"
+        with tempfile.TemporaryDirectory(prefix="rpmap-dl-") as d:
+            src = Path(d) / "new-build"
+            src.write_bytes(data)
+            dest = Path(d) / "dest"
+            good = hashlib.sha256(data).hexdigest()
+            update._download_update(f"file://{src}", dest, good, size=len(data))
+            self.assertEqual(dest.read_bytes(), data)
+            with self.assertRaises(RuntimeError):
+                update._download_update(f"file://{src}", dest, "b" * 64, size=len(data))
+            self.assertFalse(dest.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX mkdtemp/chmod permissions")
+    def test_posix_swap_script_lives_in_a_private_dir(self):
+        import shutil
+        script = update._write_posix_swap(Path("/tmp/new"), Path("/tmp/app.AppImage"), [])
+        try:
+            self.assertTrue(script.parent.name.startswith("rpmap-update-"))
+            self.assertNotEqual(script, Path(tempfile.gettempdir()) / "rpmap-update.sh")
+            self.assertEqual(stat.S_IMODE(os.stat(script).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(script.parent).st_mode), 0o700)
+        finally:
+            shutil.rmtree(script.parent, ignore_errors=True)
+
+    def test_windows_swap_script_lives_in_a_private_dir(self):
+        import shutil
+        script = update._write_windows_swap(Path(r"C:\new.exe"), Path(r"C:\app.exe"), [])
+        try:
+            self.assertTrue(script.parent.name.startswith("rpmap-update-"))
+            self.assertNotEqual(script,
+                                Path(tempfile.gettempdir()) / "rpmap-update.cmd")
+            self.assertEqual(script.name, "swap.cmd")
+        finally:
+            shutil.rmtree(script.parent, ignore_errors=True)
+
 
 class CaBundleTests(unittest.TestCase):
     """The packaged build must be able to find a CA bundle for TLS."""
@@ -155,6 +229,61 @@ class PeerTests(unittest.TestCase):
 
     def test_common_map_keys_ignores_peers_without_inventory(self):
         self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
+
+
+class SyncTargetTests(_CookedFixture):
+    """`sync_action` only contacts peers on the discovered roster.
+
+    Without that check `/api/sync` would connect to any ip:port a caller
+    names - a request proxy that also hands the session secret to whoever
+    the target happens to be.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._orig = peers.tailscale_peers
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": "friend", "name": "friend", "dns": "", "ip": "100.64.0.7",
+             "port": None, "online": True, "os": "linux"},
+            {"peer_id": "manual", "name": "manual", "dns": "", "ip": "10.1.2.3",
+             "port": 9000, "online": True, "os": "linux"},
+        ]
+
+    def tearDown(self):
+        peers.tailscale_peers = self._orig
+        super().tearDown()
+
+    def test_roster_targets_map_ips_to_ports(self):
+        allowed = peers._roster_targets({}, 8787)
+        self.assertEqual(allowed, {"100.64.0.7": 8787, "10.1.2.3": 9000})
+
+    def test_target_outside_the_roster_is_refused(self):
+        res = peers.sync_action(self.cooked, "underpass", {"session_secret": "s"},
+                                "push", [{"ip": "203.0.113.9", "port": 8787,
+                                          "name": "evil"}])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["results"][0]["error"], "not a known peer")
+
+    def test_wrong_port_for_a_roster_peer_is_refused(self):
+        res = peers.sync_action(self.cooked, "underpass", {"session_secret": "s"},
+                                "push", [{"ip": "100.64.0.7", "port": 9999,
+                                          "name": "friend"}])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["results"][0]["error"], "not a known peer")
+
+    def test_roster_peer_on_its_port_passes_the_gate(self):
+        # A roster peer at its own port gets past the gate; the connection
+        # then fails as a peer-level error (dead loopback port), never as
+        # "not a known peer".
+        dead = _free_port()
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": "friend", "name": "friend", "dns": "", "ip": "127.0.0.1",
+             "port": dead, "online": True, "os": "linux"}]
+        res = peers.sync_action(self.cooked, "underpass", {"session_secret": "s"},
+                                "push", [{"ip": "127.0.0.1", "port": dead,
+                                          "name": "friend"}])
+        self.assertFalse(res["ok"])
+        self.assertNotEqual(res["results"][0].get("error"), "not a known peer")
 
 
 class SlotTests(_CookedFixture):
@@ -350,6 +479,36 @@ class HttpTests(_CookedFixture):
         self.assertTrue(json.loads(body)["ok"])
         self.assertTrue(self.quit_called.wait(2), "request_quit was never called")
 
+    def test_session_rotation_is_allowed_from_loopback(self):
+        status, body = self._req("POST", "/api/session?token=" + self.TOKEN,
+                                 body={"secret": "a-new-code"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["secret"], "a-new-code")
+
+    def test_responses_carry_hardening_headers(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        headers = {k.lower(): v.lower() for k, v in resp.getheaders()}
+        resp.read()
+        conn.close()
+        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(headers.get("referrer-policy"), "no-referrer")
+        self.assertIn("frame-ancestors 'none'",
+                      headers.get("content-security-policy", ""))
+
+    def test_ui_never_interpolates_ids_into_js_source(self):
+        # Ids travel as data attributes to a delegated listener; inline
+        # "onclick=\"fn('${id}')\"" is an injection trap (HTML entities decode
+        # before the JS engine sees the string).
+        _, body = self._req("GET", "/")
+        self.assertIn(b"data-peer-id=", body)
+        self.assertIn(b"addEventListener('click'", body)
+        self.assertIn(b'name="referrer" content="no-referrer"', body)
+        self.assertNotIn(b'onclick="useMap(', body)
+        self.assertNotIn(b'onclick="syncFrom(', body)
+        self.assertNotIn(b'onclick="syncTo(', body)
+
     def test_running_instance_finds_the_live_server(self):
         config.write_runtime({"pid": os.getpid(), "port": self.port,
                               "token": self.TOKEN})
@@ -456,12 +615,13 @@ class EveryoneFilterTests(unittest.TestCase):
 
 
 class QuitGateTests(unittest.TestCase):
-    """/api/quit is loopback-only; the gate is a plain predicate on the peer."""
+    """The local-only gates (/api/quit, /api/session) as plain predicates."""
 
-    def _handler(self):
+    def _handler(self, ident=None):
         return web.make_handler({"cooked": Path("."), "slot": "underpass",
                                  "token": "t", "host": "127.0.0.1", "secret": "s",
-                                 "cfg": {}, "ident": {}, "dev": False, "port": 0})
+                                 "cfg": {}, "ident": ident or {}, "dev": False,
+                                 "port": 0})
 
     def test_loopback_is_allowed(self):
         class _Conn:
@@ -472,6 +632,23 @@ class QuitGateTests(unittest.TestCase):
         class _Conn:
             client_address = ("100.64.0.7", 51234)
         self.assertFalse(self._handler()._local_ok(_Conn()))
+
+    def test_own_tailnet_address_is_allowed(self):
+        # A UI served on the tailnet IP is reached by the local browser from
+        # that same address - still "this machine", still allowed to quit or
+        # rotate the session code.
+        class _Conn:
+            client_address = ("100.64.0.7", 51234)
+        handler = self._handler(ident={"peer_id": "me", "name": "me",
+                                       "ips": ["100.64.0.7"], "dns": ""})
+        self.assertTrue(handler._local_ok(_Conn()))
+
+    def test_remote_peer_on_our_tailnet_is_refused(self):
+        class _Conn:
+            client_address = ("100.64.0.9", 51234)
+        handler = self._handler(ident={"peer_id": "me", "name": "me",
+                                       "ips": ["100.64.0.7"], "dns": ""})
+        self.assertFalse(handler._local_ok(_Conn()))
 
 
 class RuntimeFileTests(unittest.TestCase):

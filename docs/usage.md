@@ -98,6 +98,12 @@ doesn't have the map reports *not installed* with a Workshop link. Syncs are **e
 reference-only — anything obtained outside the Steam Workshop syncs only if the peer already
 has the byte-identical file. Never swap during an online match.
 
+Sync requests are validated: a peer's rpmap only contacts addresses it discovered on its
+tailnet roster (or its configured `manual_peers`) — anything else is refused as *not a known
+peer*. The session code can only be rotated from the machine itself (the UI's **Join** box or
+`rpmap join`); peers can sync maps with you, but can never change your session code or stop
+your server.
+
 The map grid has an **Only maps everyone has** toggle that hides maps a reachable peer would
 have to download. "Everyone" includes **you**, so with no peers running rpmap it simply shows
 all your maps (the toggle is still usable).

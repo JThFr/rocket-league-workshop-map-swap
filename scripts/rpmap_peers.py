@@ -226,6 +226,24 @@ def _http_post_json_auth(url: str, secret: str, payload: dict, timeout: float = 
         return {"ok": False, "error": "bad response"}
 
 
+def _roster_targets(cfg: dict, default_port: int) -> dict[str, int]:
+    """ip -> the port we may contact that peer on, for known roster peers.
+
+    Sync targets must be peers this machine actually knows (the tailnet roster
+    from ``tailscale status``, plus any configured ``manual_peers``). Without
+    this check ``/api/sync`` would connect to any ``ip:port`` a caller names -
+    turning this machine into a request proxy and sending the shared session
+    secret to a host it was never meant for.
+    """
+    allowed: dict[str, int] = {}
+    for p in tailscale_peers(cfg):
+        ip = (p.get("ip") or "").strip()
+        if not ip:
+            continue
+        allowed[ip] = int(p.get("port") or default_port)
+    return allowed
+
+
 def peer_switch(cooked: Path, slot: str, payload: dict) -> dict:
     """Server side of a push: apply a map reference sent by another peer."""
     wid, nm = payload.get("workshop_id"), payload.get("name")
@@ -250,16 +268,21 @@ def sync_action(cooked: Path, slot: str, cfg: dict, mode: str, targets: list[dic
     """Push this machine's map to peers, or pull a peer's map here.
 
     Reference-only: peers must already have the map (Workshop subscription or the
-    same file). targets: [{ip, port, name}].
+    same file). targets: [{ip, port, name}] - each must be a known roster peer.
     """
     secret = cfg.get("session_secret") or ""
+    default_port = int(cfg.get("port") or DEFAULT_PORT)
+    allowed = _roster_targets(cfg, default_port)
     results: list[dict] = []
     for t in targets:
         ip = (t.get("ip") or "").strip()
-        port = int(t.get("port") or DEFAULT_PORT)
+        port = int(t.get("port") or default_port)
         who = t.get("name") or ip or "?"
         if not ip:
             results.append({"peer": who, "ok": False, "error": "no address"})
+            continue
+        if allowed.get(ip) != port:
+            results.append({"peer": who, "ok": False, "error": "not a known peer"})
             continue
         try:
             if mode == "push":
