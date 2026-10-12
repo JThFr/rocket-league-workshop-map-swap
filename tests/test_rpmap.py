@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import rpmap_config as config
+import rpmap_doctor as doctor
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -95,6 +96,22 @@ class UpdateTests(unittest.TestCase):
 
     def test_no_target_when_running_from_source(self):
         self.assertIsNone(update._update_target())
+
+    def test_posix_swap_relaunches_with_our_flags(self):
+        script = update._posix_swap_script(Path("/tmp/new"), Path("/tmp/app.AppImage"),
+                                           ["--slot", "underpass", "--restore-on-exit",
+                                            "/a path/with space"])
+        self.assertIn("nohup /tmp/app.AppImage --slot underpass --restore-on-exit "
+                      "'/a path/with space'", script)
+        self.assertIn(">/dev/null 2>&1 &", script)
+
+    def test_posix_swap_with_no_flags(self):
+        script = update._posix_swap_script(Path("/tmp/new"), Path("/tmp/app.AppImage"), [])
+        self.assertIn("nohup /tmp/app.AppImage >/dev/null 2>&1 &", script)
+
+    def test_windows_swap_forwards_its_arguments(self):
+        script = update._windows_swap_script(Path(r"C:\new.exe"), Path(r"C:\app.exe"))
+        self.assertIn('start "" "C:\\app.exe" %*', script)
 
 
 class CaBundleTests(unittest.TestCase):
@@ -399,6 +416,7 @@ class EveryoneFilterTests(unittest.TestCase):
         # peer's whole inventory.
         self.assertEqual(data["peers"][0]["map_count"], 2)
         self.assertEqual(set(data["common"]), {"n:shared:6"})
+        self.assertEqual(data["peers"][0]["reach"], "ok")
         local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
         self.assertEqual(local_keys & set(data["common"]), {"n:shared:6"})
 
@@ -416,6 +434,25 @@ class EveryoneFilterTests(unittest.TestCase):
         local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
         self.assertIsNotNone(data["common"], "filter should be available alone")
         self.assertEqual(set(data["common"]), local_keys)
+
+    def test_unreachable_reasons(self):
+        """A tailnet node that isn't serving rpmap gets a clear reason."""
+        orig = peers.tailscale_peers
+        dead = _free_port()          # nothing is listening here
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": "off", "name": "off", "dns": "", "ip": "127.0.0.1",
+             "port": dead, "online": False, "os": "windows"},
+            {"peer_id": "up", "name": "up", "dns": "", "ip": "127.0.0.1",
+             "port": dead, "online": True, "os": "windows"},
+        ]
+        try:
+            data = peers.gather_peers(self.cooked2, "underpass",
+                                      {"session_secret": "s3cr3t"}, {})
+        finally:
+            peers.tailscale_peers = orig
+        reach = {r["name"]: r["reach"] for r in data["peers"]}
+        self.assertEqual(reach["off"], "offline")
+        self.assertEqual(reach["up"], "not-rpmap")
 
 
 class QuitGateTests(unittest.TestCase):
@@ -491,6 +528,29 @@ class WindowTests(unittest.TestCase):
         finally:
             if old is not None:
                 os.environ["DISPLAY"] = old
+
+
+class DoctorTests(unittest.TestCase):
+    """`rpmap doctor` never raises and flags a missing game install."""
+
+    def test_missing_rocket_league_exits_nonzero(self):
+        self.assertEqual(doctor.run("/nonexistent/definitely-not-rocketleague", "underpass"), 1)
+
+    def test_healthy_fixture_exits_zero(self):
+        with tempfile.TemporaryDirectory(prefix="rpmap-doctor-") as d:
+            cooked = Path(d) / "TAGame" / "CookedPCConsole"
+            (cooked / "mods").mkdir(parents=True)
+            (cooked / config.SLOTS["underpass"][0]).write_bytes(b"STOCK")
+            saved = (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
+                     doctor.update.check_for_update)
+            doctor.peers.tailscale_peers = lambda cfg=None: []      # no network
+            doctor.peers.tailscale_self = lambda: {"ips": []}
+            doctor.update.check_for_update = lambda: None
+            try:
+                self.assertEqual(doctor.run(str(cooked), "underpass"), 0)
+            finally:
+                (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
+                 doctor.update.check_for_update) = saved
 
 
 def _free_port() -> int:

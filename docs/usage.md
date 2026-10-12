@@ -43,6 +43,7 @@ stop it without a terminal. This matters after a **self-update**, when the app r
 | `python3 rpmap.py serve [--host H --port P] [--restore-on-exit]` | run the web UI / peer server |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
 | `python3 rpmap.py stop` | stop a running web UI (same as its Quit button) |
+| `python3 rpmap.py doctor` | diagnose the setup (game path, slot, Tailscale, peers, TLS, window) |
 | `python3 rpmap.py version` | print the version |
 | `python3 rpmap.py check-update` | check GitHub for a newer release |
 
@@ -102,6 +103,28 @@ have to download. "Everyone" includes **you**, so with no peers running rpmap it
 all your maps (the toggle is still usable).
 
 Design notes: [`rpmap-phase2.md`](rpmap-phase2.md).
+
+The **Players** panel labels a tailnet node that isn't usable: *offline*, *online · not rpmap*
+(Tailscale is up there but rpmap isn't running / isn't bound to the tailnet), or *rpmap · no map
+list* (an older build). "In sync" counts only the reachable rpmap peers.
+
+## Troubleshooting
+
+`python3 rpmap.py doctor` prints a one-shot report of the usual suspects — where Rocket League
+was found, the slot's state and whether a stock backup exists, whether the UI is running, the
+Tailscale address, the session code, the TLS trust store (self-update), whether the status window
+can show, and how many tailnet peers are actually serving rpmap:
+
+```
+rpmap doctor
+  [ok] Rocket League: /…/TAGame/CookedPCConsole
+  [ok] slot: Utopia Retro: stock map [stock]
+  [ok] Tailscale: Julien (100.108.219.85)
+  [!!] peers: 1 on the tailnet, 0 serving rpmap
+         -> start rpmap there with `serve --host <tailscale-ip>`
+```
+
+Exit code is non-zero only when a hard check fails (e.g. Rocket League not found).
 
 ## Configuration
 

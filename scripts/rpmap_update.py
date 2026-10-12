@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -99,14 +100,13 @@ def _download_update(url: str, dest: Path, digest: str | None) -> None:
             raise RuntimeError("downloaded update failed the sha256 check")
 
 
-def _spawn_windows_swap(new_exe: Path, current_exe: Path) -> None:
-    """Write a .cmd that waits for this process to exit, swaps the exe, relaunches.
+def _windows_swap_script(new_exe: Path, current_exe: Path) -> str:
+    """The .cmd that swaps the exe after we exit and relaunches it.
 
-    A running .exe can't be overwritten on Windows, so retry ``move`` until the
-    file unlocks, then start the new build. ``ping`` is the delay because
-    ``timeout`` needs a console, which a detached process doesn't have.
+    ``%*`` forwards this script's own arguments, so the relaunched build keeps
+    the flags we were started with (``--slot``, ``--cooked``, ``--restore-on-exit``,
+    ``--host`` …). The caller passes ``sys.argv[1:]`` when invoking the script.
     """
-    cmd = Path(tempfile.gettempdir()) / "rpmap-update.cmd"
     lines = [
         "@echo off",
         "setlocal",
@@ -119,26 +119,37 @@ def _spawn_windows_swap(new_exe: Path, current_exe: Path) -> None:
         "ping -n 2 127.0.0.1 >nul",
         "goto retry",
         ":replaced",
-        f'start "" "{current_exe}"',
+        f'start "" "{current_exe}" %*',
         'del "%~f0"',
         "",
     ]
-    cmd.write_text("\r\n".join(lines))
+    return "\r\n".join(lines)
+
+
+def _spawn_windows_swap(new_exe: Path, current_exe: Path, args: list[str]) -> None:
+    """Write (and detach) the .cmd that swaps the exe and relaunches it.
+
+    A running .exe can't be overwritten on Windows, so retry ``move`` until the
+    file unlocks, then start the new build. ``ping`` is the delay because
+    ``timeout`` needs a console, which a detached process doesn't have.
+    """
+    cmd = Path(tempfile.gettempdir()) / "rpmap-update.cmd"
+    cmd.write_text(_windows_swap_script(new_exe, current_exe))
     detached = 0x00000008          # DETACHED_PROCESS
     new_group = 0x00000200         # CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(["cmd", "/c", str(cmd)],
+    subprocess.Popen(["cmd", "/c", str(cmd), *args],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True,
                      creationflags=detached | new_group)
 
 
-def _spawn_posix_swap(new_file: Path, target: Path) -> None:
-    """Detached shell that swaps the AppImage once we exit, then relaunches.
+def _posix_swap_script(new_file: Path, target: Path, args: list[str]) -> str:
+    """The shell script that swaps the AppImage/ELF after we exit, then relaunches.
 
-    A running AppImage is a FUSE mount point, so ``mv`` over it fails until the
-    process exits and unmounts - hence the retry loop.
+    The relaunch includes ``args`` (our ``sys.argv[1:]``), shell-quoted, so the
+    new build keeps the flags we were started with.
     """
-    script = Path(tempfile.gettempdir()) / "rpmap-update.sh"
+    relaunch = " ".join(shlex.quote(a) for a in [str(target), *args])
     lines = [
         "#!/bin/sh",
         "n=0",
@@ -148,11 +159,21 @@ def _spawn_posix_swap(new_file: Path, target: Path) -> None:
         "  sleep 1",
         "done",
         f'chmod +x "{target}"',
-        f'nohup "{target}" >/dev/null 2>&1 &',
+        f'nohup {relaunch} >/dev/null 2>&1 &',
         'rm -f "$0"',
         "",
     ]
-    script.write_text("\n".join(lines))
+    return "\n".join(lines)
+
+
+def _spawn_posix_swap(new_file: Path, target: Path, args: list[str]) -> None:
+    """Write (and detach) the shell script that swaps the file and relaunches.
+
+    A running AppImage is a FUSE mount point, so ``mv`` over it fails until the
+    process exits and unmounts - hence the retry loop.
+    """
+    script = Path(tempfile.gettempdir()) / "rpmap-update.sh"
+    script.write_text(_posix_swap_script(new_file, target, args))
     os.chmod(script, 0o755)
     subprocess.Popen(["/bin/sh", str(script)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -172,12 +193,13 @@ def apply_update(info: dict) -> None:
     except Exception as e:
         print(f"rpmap: update download failed: {e}", file=sys.stderr)
         return
+    args = list(sys.argv[1:])       # keep our flags across the restart
     if kind == "exe":
-        _spawn_windows_swap(staged, path)
+        _spawn_windows_swap(staged, path, args)
         print(f"rpmap: updating to {info.get('version')} - restarting...", flush=True)
         os._exit(0)
     if kind == "appimage":
-        _spawn_posix_swap(staged, path)
+        _spawn_posix_swap(staged, path, args)
         print(f"rpmap: updating to {info.get('version')} - restarting...", flush=True)
         os._exit(0)
     try:                       # plain Linux binary: replace the running file in place
