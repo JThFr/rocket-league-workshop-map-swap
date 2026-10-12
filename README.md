@@ -64,6 +64,10 @@ Starting it also opens a small **status window** ("rpmap is running", with Open 
 stock / Quit) so you can always tell it's up and stop it without a terminal — useful after a
 self-update, which runs the app detached. `--no-window` turns it off.
 
+Something not working? **`rpmap doctor`** prints a health report — game path, slot + backup,
+Tailscale, session code, self-update TLS, the status window, and which tailnet peers are actually
+serving rpmap.
+
 ## The swap, and the rules
 
 - In Free Play / Custom Games, pick the arena that matches your **slot**. The default is a

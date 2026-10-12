@@ -319,10 +319,17 @@ function syncBadge(s){
   if(s==='different') return '<span class="badge b-custom">out of sync</span>';
   return '<span class="badge b-missing">unknown</span>';
 }
+function reachLabel(p){
+  if(p.reach==='offline') return '<span class="badge b-missing">offline</span>';
+  if(p.reach==='not-rpmap') return '<span class="badge b-unknown">online \u00b7 not rpmap</span>';
+  if(p.reach==='no-inventory') return '<span class="badge b-custom">rpmap \u00b7 no map list</span>';
+  return '<span class="badge b-missing">unreachable</span>';
+}
 function peerRow(p, isSelf){
   const dot = `<span class="dot ${p.online?'on':'off'}"></span>`;
   const slot = p.slot || {};
-  const map = slot.map_name ? esc(slot.map_name)
+  const map = !p.rpmap && !isSelf ? reachLabel(p)
+            : slot.map_name ? esc(slot.map_name)
             : slot.state==='stock' ? 'Stock map'
             : slot.state ? esc(slot.state) : '\u2014';
   const size = slot.size ? fmtSize(slot.size) : '';
@@ -368,10 +375,15 @@ async function loadPeers(){
     '<tr><th>Player</th><th>IP</th><th>Version</th><th>Loaded map</th><th>Size</th><th>Hash</th><th></th></tr>'
     + rows.join('');
   const n = PEERS.length;
+  const reachable = PEERS.filter(p => p.rpmap).length;
   const same = PEERS.filter(p => p.in_sync==='same').length;
   const vdiff = PEERS.filter(p => p.version && SELF_VER && p.version !== SELF_VER).length;
   document.getElementById('peersEmpty').style.display = n ? 'none' : 'block';
-  let status = n ? (same + '/' + n + ' in sync') : 'no peers';
+  let status;
+  if(!n) status = 'no peers';
+  else if(!reachable) status = 'no reachable peers';
+  else status = same + '/' + reachable + ' in sync'
+    + (n > reachable ? ' \u00b7 ' + (n - reachable) + ' unreachable' : '');
   if(vdiff) status += ' \u00b7 ' + vdiff + ' on a different rpmap version';
   if(COMMON) status += ' \u00b7 ' + COMMON.length + (n ? ' map(s) everyone has' : ' map(s) (all yours)');
   document.getElementById('peersStatus').textContent = status;

@@ -132,6 +132,8 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> 
         "online": bool(p.get("online")), "rpmap": False, "port": pport,
         "slot": None, "sha256": None, "in_sync": "unknown", "version": None,
         "map_count": None,
+        # Why we couldn't reach it (kept meaningful for reachable rows too).
+        "reach": "offline" if not p.get("online") else "not-rpmap",
     }
     if not got:
         return row
@@ -184,6 +186,9 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
     common = common_map_keys([self_keys, *contributors])
     for r in roster:
         r["map_count"] = len(r["_keys"]) if r["_keys"] is not None else None
+        if r["rpmap"]:
+            # reachable, but an old build may not expose /api/maps
+            r["reach"] = "ok" if r["_keys"] is not None else "no-inventory"
         r.pop("_keys", None)
     roster.sort(key=lambda r: (r.get("name") or ""))
 

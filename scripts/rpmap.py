@@ -30,6 +30,7 @@ Usage:
   python3 rpmap.py join <code>          # save a session code shared by a peer
   python3 rpmap.py name <display>       # set the name peers see
   python3 rpmap.py stop                 # stop a running UI (or use its Quit button)
+  python3 rpmap.py doctor               # diagnose paths, peers, Tailscale, TLS
   python3 rpmap.py version              # print the version
   python3 rpmap.py check-update         # check GitHub for a newer release
 
@@ -49,6 +50,7 @@ import json
 import sys
 from pathlib import Path
 
+import rpmap_doctor
 from rpmap_config import (APP_VERSION, PRODUCT, SLOTS, SLOT_INFO,
                           DEFAULT_SLOT, config_path, load_config, new_secret,
                           save_config)
@@ -127,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     p_nm = sub.add_parser("name", help="set the display name peers see")
     p_nm.add_argument("value")
     sub.add_parser("stop", help="stop a running rpmap UI")
+    sub.add_parser("doctor", help="diagnose the environment (paths, peers, Tailscale, TLS)")
     sub.add_parser("version", help="print the version")
     sub.add_parser("check-update", help="check GitHub for a newer release")
 
@@ -162,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         print("rpmap is not running")
         return 0
+
+    if args.cmd == "doctor":
+        return rpmap_doctor.run(args.cooked, args.slot)
 
     if args.cmd == "version":
         print(f"{PRODUCT} {APP_VERSION}")
@@ -222,11 +228,18 @@ def main(argv: list[str] | None = None) -> int:
             slot = p.get("slot") or {}
             loaded = _slot_label({"state": slot.get("state"), "map_name": slot.get("map_name")})
             if not p.get("rpmap"):
-                loaded = "unreachable"
+                loaded = {"offline": "offline",
+                          "not-rpmap": "online, not rpmap",
+                          "no-inventory": "rpmap (no map list)"}.get(
+                              p.get("reach"), "unreachable")
             dot = "online" if p.get("online") else "offline"
             ver = "v" + (p.get("version") or "?")
             print(f"  [{dot:<7}] {str(p.get('name') or '?'):<22} "
                   f"{str(p.get('ip') or '?'):<16} {loaded:<28} {str(p.get('in_sync')):<9} {ver}")
+        unreachable = sum(1 for p in data["peers"] if not p.get("rpmap"))
+        if unreachable:
+            print(f"  ({unreachable} peer(s) not serving rpmap - start it there with "
+                  f"`serve --host <tailscale-ip>`)")
         if not data["peers"]:
             print("  (no peers found - start tailscaled, or set manual_peers in config)")
         return 0
