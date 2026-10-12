@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller / build output
+build/
+dist/
+*.spec
+
+# Map files (never commit these)
+*.upk
+*.udk
+*.orig

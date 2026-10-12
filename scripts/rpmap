@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# rpmap - thin launcher for the unified cross-platform tool (scripts/rpmap.py).
+#
+# Everything lives in rpmap.py so there is ONE implementation for Linux and
+# Windows:
+#   rpmap list | current | use <name|path> | restore      # slot swap
+#   rpmap install <file> | status <host> [port] | fetch <host> [port]
+#   rpmap [serve]                                          # visual UI (browser)
+#
+# Windows: install Python and run  python rpmap.py <command> .
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+py="${PYTHON:-python3}"
+command -v "$py" >/dev/null 2>&1 || py=python
+
+exec "$py" "$here/rpmap.py" "$@"
