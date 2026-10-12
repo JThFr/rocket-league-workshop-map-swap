@@ -134,7 +134,7 @@ PAGE = r"""<!doctype html>
 
   <div class="row" style="margin-bottom:12px">
     <input class="search" id="search" placeholder="Filter maps..." oninput="render()">
-    <label class="muted" id="everyoneLabel" title="Show only maps that every reachable peer running rpmap already has">
+    <label class="muted" id="everyoneLabel" title="Show only maps that every reachable peer running rpmap - and you - already have (all your maps when you're alone)">
       <input type="checkbox" id="everyoneOnly" onchange="render()"> Only maps everyone has
     </label>
     <span class="muted" id="count"></span>
@@ -248,8 +248,9 @@ function render(){
   onlyBox.disabled = !commonSet;
   let maps = (STATE.maps||[]).filter(m => !q || m.name.toLowerCase().includes(q));
   if (onlyBox.checked && commonSet) maps = maps.filter(m => commonSet.has(m.key));
+  const hasPeers = !!(PEERS && PEERS.length);
   document.getElementById('count').textContent = maps.length + ' map(s)'
-    + (onlyBox.checked && commonSet ? ' \u00b7 everyone has' : '');
+    + (onlyBox.checked && commonSet ? (hasPeers ? ' \u00b7 everyone has' : ' \u00b7 no peers') : '');
   document.getElementById('grid').innerHTML = maps.map(m => {
     const active = s.map_id && s.map_id === m.id;
     return `<div class="card${active?' is-active':''}">
@@ -372,7 +373,7 @@ async function loadPeers(){
   document.getElementById('peersEmpty').style.display = n ? 'none' : 'block';
   let status = n ? (same + '/' + n + ' in sync') : 'no peers';
   if(vdiff) status += ' \u00b7 ' + vdiff + ' on a different rpmap version';
-  if(COMMON) status += ' \u00b7 ' + COMMON.length + ' map(s) everyone has';
+  if(COMMON) status += ' \u00b7 ' + COMMON.length + (n ? ' map(s) everyone has' : ' map(s) (all yours)');
   document.getElementById('peersStatus').textContent = status;
   render();   // refresh the "everyone has" filter availability/count
 }

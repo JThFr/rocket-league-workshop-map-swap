@@ -12,8 +12,8 @@ import urllib.request
 from pathlib import Path
 
 from rpmap_config import APP_VERSION, DEFAULT_PORT, PRODUCT
-from rpmap_maps import (_slot_paths, file_hash, find_map_by, slot_state, use_map,
-                        workshop_url)
+from rpmap_maps import (_slot_paths, file_hash, find_map_by, map_inventory,
+                        slot_state, use_map, workshop_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -115,8 +115,9 @@ def probe_peer(ip: str | None, port: int, secret: str, timeout: float = 2.0) -> 
 def common_map_keys(key_sets: list[set[str] | None]) -> list[str] | None:
     """Map keys present in every given set (peers we could actually query).
 
-    Returns None when there is nothing to intersect (no reachable rpmap peer),
-    which the UI treats as "filter unavailable".
+    Returns None when there is nothing to intersect, which the UI treats as
+    "filter unavailable". ``gather_peers`` always passes this machine's own
+    inventory too, so in practice the result is non-None whenever we have maps.
     """
     sets = [set(s) for s in key_sets if s is not None]
     if not sets:
@@ -174,9 +175,13 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
                                 if got and got.get("maps") is not None else None)
                 roster.append(row)
 
-    # "Everyone" = reachable rpmap peers we could actually query for an inventory.
+    # "Everyone" includes *this* machine, so the filter is meaningful (and the
+    # UI toggle usable) even with no peers. The grid already intersects with our
+    # own maps, so adding ourselves is a no-op when peers are present - but it
+    # makes "everyone has" vacuously true when we're alone instead of undefined.
+    self_keys = {e["key"] for e in map_inventory(cooked) if e.get("key")}
     contributors = [r["_keys"] for r in roster if r.get("rpmap") and r["_keys"] is not None]
-    common = common_map_keys(contributors)
+    common = common_map_keys([self_keys, *contributors])
     for r in roster:
         r["map_count"] = len(r["_keys"]) if r["_keys"] is not None else None
         r.pop("_keys", None)

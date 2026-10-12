@@ -394,12 +394,28 @@ class EveryoneFilterTests(unittest.TestCase):
         finally:
             peers.tailscale_peers = orig
 
-        # "everyone" = the peers' intersection (here, the single peer's whole
-        # inventory); the grid then intersects that with the maps this machine has.
+        # "everyone" = this machine AND every reachable peer, so `common` is the
+        # intersection including our own inventory (shared here), not just the
+        # peer's whole inventory.
         self.assertEqual(data["peers"][0]["map_count"], 2)
-        self.assertEqual(set(data["common"]), {"n:shared:6", "n:only1:5"})
+        self.assertEqual(set(data["common"]), {"n:shared:6"})
         local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
         self.assertEqual(local_keys & set(data["common"]), {"n:shared:6"})
+
+    def test_everyone_includes_this_machine_when_alone(self):
+        """With no peers the filter is still usable: 'everyone' is just us."""
+        orig = peers.tailscale_peers
+        peers.tailscale_peers = lambda cfg=None: []
+        try:
+            data = peers.gather_peers(self.cooked2, "underpass",
+                                      {"session_secret": "s3cr3t"}, {})
+        finally:
+            peers.tailscale_peers = orig
+
+        self.assertEqual(data["peers"], [])
+        local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
+        self.assertIsNotNone(data["common"], "filter should be available alone")
+        self.assertEqual(set(data["common"]), local_keys)
 
 
 class QuitGateTests(unittest.TestCase):
