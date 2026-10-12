@@ -118,7 +118,9 @@ the release tag.
 
 Releases are automatic: a push/merge to `main` runs the `release` workflow, which reads `VERSION`
 and, if the tag `v<VERSION>` doesn't already exist, builds both binaries and creates a GitHub
-Release tagged `v<VERSION>`.
+Release tagged `v<VERSION>`. That same run then **prunes older releases**: only the newest **10**
+are kept (each carries both assets, ~32 MB). The **git tags are kept**, so version history and
+rollback links survive — only the release and its downloadable assets are removed.
 
 **Bump `VERSION` in every PR** — a CI check (`version-check`) fails a pull request whose `VERSION`
 is not a valid increase over `main`, for example `0.3.1 → 0.3.2` (patch), `0.3.1 → 0.4.0` (minor),
