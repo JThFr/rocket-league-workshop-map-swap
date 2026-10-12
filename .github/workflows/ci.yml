@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit + integration tests
+        run: python -m unittest discover -s tests -v
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  # A plain job in the caller workflow. Jobs inside a reusable workflow report
+  # as "<caller job> / <called job>", so their names move if the structure
+  # changes. This gate has a stable, prefix-free check name and only passes
+  # when the tests and both builds succeed - require this one in branch
+  # protection.
+  gate:
+    needs: [test, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        run: |
+          echo "test=${{ needs.test.result }}  build=${{ needs.build.result }}"
+          [ "${{ needs.test.result }}" = "success" ] || { echo "::error::tests did not pass"; exit 1; }
+          [ "${{ needs.build.result }}" = "success" ] || { echo "::error::a build did not pass"; exit 1; }

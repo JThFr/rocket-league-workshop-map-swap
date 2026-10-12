@@ -9,6 +9,11 @@ build/
 dist/
 *.spec
 
+# AppImage build output
+*.AppImage
+*.AppDir/
+rpmap.AppDir/
+
 # Map files (never commit these)
 *.upk
 *.udk
