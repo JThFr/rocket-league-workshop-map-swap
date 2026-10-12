@@ -18,10 +18,13 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
       - name: Build exe
-        run: pyinstaller --onefile --console --name rpmap scripts/rpmap.py
+        run: pyinstaller --onefile --console --name rpmap --add-data "VERSION;." scripts/rpmap.py
       - name: Smoke-test the exe
         run: |
-          .\dist\rpmap.exe version
+          $expected = "rpmap $(Get-Content VERSION)"
+          $got = .\dist\rpmap.exe version
+          Write-Host "expected: '$expected'  got: '$got'"
+          if ($got -ne $expected) { throw "built exe reports the wrong version" }
           .\dist\rpmap.exe --help
       - uses: actions/upload-artifact@v4
         with:
@@ -38,7 +41,7 @@ jobs:
       - name: Build one-file binary
         run: |
           python -m pip install --upgrade pip pyinstaller
-          pyinstaller --onefile --console --name rpmap scripts/rpmap.py
+          pyinstaller --onefile --console --name rpmap --add-data "VERSION:." scripts/rpmap.py
       - name: Assemble AppDir
         run: |
           set -euo pipefail
@@ -63,7 +66,11 @@ jobs:
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run rpmap.AppDir rpmap-x86_64.AppImage
       - name: Smoke-test binary and AppImage
         run: |
-          ./dist/rpmap version
+          set -euo pipefail
+          expected="rpmap $(cat VERSION)"
+          got="$(./dist/rpmap version)"
+          echo "expected: '$expected'  got: '$got'"
+          [ "$got" = "$expected" ] || { echo "::error::built binary reports the wrong version"; exit 1; }
           ./rpmap-x86_64.AppImage --appimage-extract-and-run version
       - uses: actions/upload-artifact@v4
         with:
