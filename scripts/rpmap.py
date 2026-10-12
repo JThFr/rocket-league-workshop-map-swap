@@ -1699,6 +1699,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--slot", default=DEFAULT_SLOT, choices=sorted(SLOTS))
     ap.add_argument("--no-update-check", action="store_true",
                     help="skip the startup check for a newer GitHub release")
+    ap.add_argument("--restore-on-exit", dest="restore_on_exit", action="store_true",
+                    help="restore the stock map when the program exits cleanly")
     sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("list", help="list candidate maps")
@@ -1721,7 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
     p_srv.add_argument("--secret", help="session code shared with peers")
     p_srv.add_argument("--dev", action="store_true",
                        help="also accept private-LAN peers (testing without Tailscale)")
-    p_srv.add_argument("--restore-on-exit", action="store_true",
+    p_srv.add_argument("--restore-on-exit", dest="restore_on_exit_serve", action="store_true",
                        help="restore the stock map when the program exits cleanly")
     sub.add_parser("peers", help="show tailnet peers and their loaded maps")
     p_ss = sub.add_parser("session", help="show or rotate the shared session code")
@@ -1787,7 +1789,8 @@ def main(argv: list[str] | None = None) -> int:
                           not getattr(args, "no_browser", False),
                           secret=getattr(args, "secret", None),
                           dev=getattr(args, "dev", False),
-                          restore_on_exit=getattr(args, "restore_on_exit", False))
+                          restore_on_exit=(getattr(args, "restore_on_exit_serve", False)
+                                           or getattr(args, "restore_on_exit", False)))
 
     if args.cmd == "list":
         for m in list_maps(cooked):

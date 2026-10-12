@@ -34,7 +34,7 @@ scripts/rpmap list
 | `python3 rpmap.py check-update` | check GitHub for a newer release |
 
 Global options: `--cooked <path>` (override the game's `CookedPCConsole`), `--slot <name>`,
-`--no-update-check`.
+`--no-update-check`, `--restore-on-exit`.
 
 ### Slot & arena
 
@@ -44,8 +44,9 @@ Play:
 - `utopia` (**default**) → `Labs_Utopia_P.upk` (arena **Utopia Retro**) — not in online playlists
 - `underpass` → `Labs_Underpass_P.upk` (arena **Underpass**) — used in Rumble; not "Tokyo Underpass"
 
-`serve --restore-on-exit` puts the stock map back when the program exits cleanly (Ctrl+C or
-closing the terminal); the UI's "Restore stock map" button does it on demand.
+`--restore-on-exit` is a global flag (so it also works with the no-argument UI launch, e.g.
+`./rpmap-x86_64.AppImage --restore-on-exit`) and puts the stock map back when the program exits
+cleanly (Ctrl+C, or closing the terminal). The UI's "Restore stock map" button does it on demand.
 
 ## Web UI
 
