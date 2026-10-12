@@ -112,6 +112,24 @@ class SlotTests(_CookedFixture):
         b.write_bytes(a.read_bytes())
         self.assertEqual(rpmap.file_hash(a), rpmap.file_hash(b))
 
+    def test_slot_state_reports_arena_name(self):
+        st = rpmap.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["arena"], "Underpass")
+        self.assertEqual(st["note"], 'NOT "Tokyo Underpass"')
+        self.assertEqual(rpmap.slot_state(self.cooked, "utopia")["arena"], "Utopia Retro")
+
+
+class RestoreOnExitTests(_CookedFixture):
+    def test_restores_a_swapped_slot(self):
+        rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "custom")
+        rpmap._restore_on_exit(self.cooked, "underpass")
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "stock")
+
+    def test_is_a_noop_without_a_backup(self):
+        rpmap._restore_on_exit(self.cooked, "underpass")   # must not raise
+        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "unknown")
+
 
 class MapsTests(_CookedFixture):
     def test_list_maps_finds_mods(self):

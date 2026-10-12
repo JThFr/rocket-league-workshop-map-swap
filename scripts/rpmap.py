@@ -4,10 +4,12 @@
 Two independent jobs:
 
   1. "slot swap" (no mods, no restart)
-     Rocket League always loads the stock arena Labs_Underpass_P.upk when you
-     pick arena **Underpass** (NOT "Tokyo Underpass"). Overwrite that one file
-     and the game loads your custom map - no BakkesMod, no Rocket Plugin, no
-     restart. This tool backs up the stock file and swaps maps in and out.
+     Rocket League loads a stock arena package whenever you pick that arena.
+     Overwrite that one file and the game loads your custom map - no BakkesMod,
+     no Rocket Plugin, no restart. The default slot is **Utopia Retro**
+     (`Labs_Utopia_P.upk`), which isn't used in online playlists; **Underpass**
+     (`Labs_Underpass_P.upk`, used in Rumble) is also available via `--slot`.
+     The tool backs up the stock file and swaps maps in and out.
 
   2. Rocket Plugin staging
      Copy maps into CookedPCConsole/{mods,rocketplugin} so BakkesMod's Rocket
@@ -51,6 +53,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -70,10 +73,15 @@ from urllib.parse import urlparse, parse_qs
 
 # slot key -> (file RL loads, alternate "original" backup name other tools use)
 SLOTS = {
-    "underpass": ("Labs_Underpass_P.upk", "ORIGINAL_UNDERPASS.upk"),
     "utopia": ("Labs_Utopia_P.upk", "ORIGINAL_UTOPIA.upk"),
+    "underpass": ("Labs_Underpass_P.upk", "ORIGINAL_UNDERPASS.upk"),
 }
-DEFAULT_SLOT = "underpass"
+# In-game arena name per slot, plus a selection gotcha shown in the UI.
+SLOT_INFO = {
+    "utopia": {"arena": "Utopia Retro", "note": ""},
+    "underpass": {"arena": "Underpass", "note": 'NOT "Tokyo Underpass"'},
+}
+DEFAULT_SLOT = "utopia"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".webp"}
 TITLE_RE = re.compile(r'"title"\s+"([^"]*)"')
 PATH_RE = re.compile(r'"path"\s+"([^"]*)"')
@@ -669,7 +677,9 @@ def slot_state(cooked: Path, slot: str = DEFAULT_SLOT) -> dict:
     slot_file, backup, alt = _slot_paths(cooked, slot)
     eff = _effective_backup(backup, alt)
     state = {
-        "slot": slot, "slot_file": str(slot_file), "exists": slot_file.is_file(),
+        "slot": slot, "arena": SLOT_INFO.get(slot, {}).get("arena", slot),
+        "note": SLOT_INFO.get(slot, {}).get("note", ""),
+        "slot_file": str(slot_file), "exists": slot_file.is_file(),
         "state": "missing", "map_name": None, "map_id": None, "size": 0, "modified": None,
         "backup_exists": bool(eff), "backup_path": str(eff) if eff else None,
         "sha256": None, "workshop_id": None,
@@ -1000,7 +1010,7 @@ def sync_action(cooked: Path, slot: str, cfg: dict, mode: str, targets: list[dic
                 ps = caps.get("slot") or {}
                 if ps.get("state") == "stock" or not ps.get("sha256"):
                     results.append({"peer": who, "ok": False,
-                                    "error": "peer is on stock Underpass"})
+                                    "error": "peer is on the stock map"})
                     continue
                 mp = find_map_by(cooked, workshop_id=ps.get("workshop_id"),
                                  name=ps.get("map_name"), sha256=ps.get("sha256"))
@@ -1110,17 +1120,17 @@ PAGE = r"""<!doctype html>
   <section class="hero" id="hero">
     <div class="hero-thumb" id="heroThumb"><span class="ph">&#127918;</span></div>
     <div class="hero-info">
-      <div class="hero-label">Underpass slot currently loads</div>
+      <div class="hero-label" id="heroLabel">Slot currently loads</div>
       <div class="hero-name" id="currentName">-</div>
       <div class="hero-sub">
         <span class="badge b-missing" id="slotBadge">loading...</span>
         <span class="muted" id="currentMeta"></span>
       </div>
-      <div class="hint">In game: <b>Free Play &rarr; arena "Underpass"</b> &mdash; NOT "Tokyo Underpass".
-        Restore the stock map before playing online (Rumble uses Underpass).</div>
+      <div class="hint" id="heroHint">In game: pick the matching arena in Free Play.
+        Restore the stock map before playing online.</div>
     </div>
     <div class="hero-actions">
-      <button id="restoreBtn" class="danger" onclick="restore()">Restore stock Underpass</button>
+      <button id="restoreBtn" class="danger" onclick="restore()">Restore stock map</button>
     </div>
   </section>
 
@@ -1159,6 +1169,8 @@ PAGE = r"""<!doctype html>
 <div class="toast" id="toast"></div>
 <script>
 let STATE = null;
+let ARENA = 'the arena';
+let ARENA_NOTE = '';
 const token = new URLSearchParams(location.search).get('token') || '';
 const api = (p, opts={}) => fetch(p + (p.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token), opts);
 const prevUrl = id => '/api/preview?id=' + encodeURIComponent(id) + '&token=' + encodeURIComponent(token);
@@ -1190,16 +1202,23 @@ async function load_state(){
 function render(){
   if(!STATE) return;
   const s = STATE.slot;
+  ARENA = s.arena || 'the arena';
+  ARENA_NOTE = s.note || '';
   document.getElementById('pathLabel').textContent = STATE.cooked || '';
+  document.getElementById('heroLabel').textContent = ARENA + ' slot currently loads';
+  document.getElementById('heroHint').innerHTML =
+    `In game: <b>Free Play &rarr; arena "${esc(ARENA)}"</b>` +
+    (ARENA_NOTE ? ' &mdash; ' + esc(ARENA_NOTE) : '') +
+    '. Restore the stock map before playing online.';
 
   const hero = document.getElementById('hero');
   hero.className = 'hero is-' + s.state;
   const name = s.map_name ? s.map_name
-             : (s.state==='stock' ? 'Stock Underpass'
+             : (s.state==='stock' ? 'Stock map'
              : (s.state==='missing' ? 'Slot file missing' : 'Unknown map'));
   document.getElementById('currentName').textContent = name;
 
-  const labels = {stock:'stock Underpass', custom:'custom map', unknown:'unrecognised', missing:'no slot file'};
+  const labels = {stock:'stock map', custom:'custom map', unknown:'unrecognised', missing:'no slot file'};
   const badge = document.getElementById('slotBadge');
   badge.className = 'badge b-' + ({stock:'stock',custom:'custom',unknown:'unknown',missing:'missing'}[s.state]||'unknown');
   badge.textContent = labels[s.state] || s.state;
@@ -1239,16 +1258,16 @@ function render(){
 
 async function useMap(id){
   const m = (STATE.maps||[]).find(x=>x.id===id); if(!m) return;
-  if(!confirm(`Load "${m.name}" into the Underpass slot?\n\nThen in game: Free Play -> arena "Underpass".`)) return;
+  if(!confirm(`Load "${m.name}" into the ${ARENA} slot?\n\nThen in game: Free Play -> arena "${ARENA}".`)) return;
   toast('Swapping map...');
   const j = await (await api('/api/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
   toast(j.ok ? ('Loaded: ' + m.name) : ('Error: ' + (j.error||'failed')));
   load_state();
 }
 async function restore(){
-  if(!confirm('Restore the stock Underpass? Do this before playing online.')) return;
+  if(!confirm(`Restore the stock ${ARENA} map? Do this before playing online.`)) return;
   const j = await (await api('/api/restore',{method:'POST'})).json();
-  toast(j.ok ? 'Stock Underpass restored' : ('Error: ' + (j.error||'failed')));
+  toast(j.ok ? 'Stock map restored' : ('Error: ' + (j.error||'failed')));
   load_state();
 }
 
@@ -1283,7 +1302,7 @@ function peerRow(p, isSelf){
   const dot = `<span class="dot ${p.online?'on':'off'}"></span>`;
   const slot = p.slot || {};
   const map = slot.map_name ? esc(slot.map_name)
-            : slot.state==='stock' ? 'Stock Underpass'
+            : slot.state==='stock' ? 'Stock map'
             : slot.state ? esc(slot.state) : '\u2014';
   const size = slot.size ? fmtSize(slot.size) : '';
   const hash = p.sha256 ? `<code>${esc(String(p.sha256).slice(0,10))}</code>` : '';
@@ -1356,8 +1375,8 @@ async function doSync(mode, targets){
         : who + " doesn't have the map (needs a Workshop download)";
     } else if(b.error === 'version mismatch'){
       msg = 'Map content differs on ' + who + ' \u2014 not swapped';
-    } else if(b.error === 'peer is on stock Underpass'){
-      msg = who + ' is on Stock Underpass';
+    } else if(b.error === 'peer is on the stock map'){
+      msg = who + ' is on the stock map';
     } else {
       msg = (b.peer ? who + ': ' : '') + (b.error || 'sync failed');
     }
@@ -1577,8 +1596,40 @@ def _open_browser(url: str) -> None:
     webbrowser.open(url)
 
 
+def _install_stop_signals() -> None:
+    """Turn SIGTERM/SIGHUP into a clean shutdown so on-exit work still runs.
+
+    Ctrl+C already raises KeyboardInterrupt; closing the terminal sends SIGHUP,
+    which would otherwise kill the process without running the ``finally``.
+    """
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass
+
+
+def _restore_on_exit(cooked: Path, slot: str) -> None:
+    """Put the stock map back when the program exits cleanly (opt-in)."""
+    try:
+        st = slot_state(cooked, slot)
+        if st["state"] in ("custom", "unknown") and st["backup_exists"]:
+            restore_slot(cooked, slot)
+            arena = SLOT_INFO.get(slot, {}).get("arena", slot)
+            print(f"restored the stock {arena} map on exit", flush=True)
+    except Exception as e:
+        print(f"could not restore the stock map on exit: {e}", file=sys.stderr)
+
+
 def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool,
-               secret: str | None = None, dev: bool = False) -> int:
+               secret: str | None = None, dev: bool = False,
+               restore_on_exit: bool = False) -> int:
     cfg = load_config()
     if secret:
         cfg["session_secret"] = secret
@@ -1607,11 +1658,14 @@ def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool
         print(f"note: bound to {host}; peers reach this on port {actual}", flush=True)
     if open_browser:
         threading.Thread(target=lambda: _open_browser(url), daemon=True).start()
+    _install_stop_signals()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
     finally:
+        if restore_on_exit:
+            _restore_on_exit(cooked, slot)
         httpd.server_close()
     return 0
 
@@ -1631,7 +1685,7 @@ def _fmt(n: int) -> str:
 
 def _slot_label(s: dict) -> str:
     if s["state"] == "stock":
-        return "Stock Underpass"
+        return "Stock map"
     if s["map_name"]:
         return s["map_name"]
     return {"custom": "(custom map)", "unknown": "(not stock, not in map list)",
@@ -1667,6 +1721,8 @@ def main(argv: list[str] | None = None) -> int:
     p_srv.add_argument("--secret", help="session code shared with peers")
     p_srv.add_argument("--dev", action="store_true",
                        help="also accept private-LAN peers (testing without Tailscale)")
+    p_srv.add_argument("--restore-on-exit", action="store_true",
+                       help="restore the stock map when the program exits cleanly")
     sub.add_parser("peers", help="show tailnet peers and their loaded maps")
     p_ss = sub.add_parser("session", help="show or rotate the shared session code")
     p_ss.add_argument("--new", action="store_true", help="generate a new code")
@@ -1730,7 +1786,8 @@ def main(argv: list[str] | None = None) -> int:
                           getattr(args, "port", 8787),
                           not getattr(args, "no_browser", False),
                           secret=getattr(args, "secret", None),
-                          dev=getattr(args, "dev", False))
+                          dev=getattr(args, "dev", False),
+                          restore_on_exit=getattr(args, "restore_on_exit", False))
 
     if args.cmd == "list":
         for m in list_maps(cooked):
@@ -1772,13 +1829,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"No map matched '{args.map}'. Try: rpmap list", file=sys.stderr)
             return 1
         use_map(cooked, args.slot, Path(m["path"]))
-        print(f"Loaded '{m['name']}' into the {args.slot} slot.")
-        print('In game: Free Play -> arena "Underpass" (not "Tokyo Underpass").')
+        info = SLOT_INFO.get(args.slot, {})
+        arena = info.get("arena", args.slot)
+        note = f" ({info['note']})" if info.get("note") else ""
+        print(f"Loaded '{m['name']}' into the {arena} slot.")
+        print(f'In game: Free Play -> arena "{arena}"{note}.')
         return 0
 
     if args.cmd == "restore":
         restore_slot(cooked, args.slot)
-        print("Stock Underpass restored.")
+        print("Stock map restored.")
         return 0
 
     if args.cmd == "install":
