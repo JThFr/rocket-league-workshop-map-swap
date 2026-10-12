@@ -87,7 +87,7 @@ _preview_url_cache: dict[str, str] = {}
 # --------------------------------------------------------------------------- #
 
 PRODUCT = "rpmap"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DEFAULT_PORT = 8787
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 
