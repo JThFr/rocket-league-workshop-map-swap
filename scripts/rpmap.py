@@ -87,7 +87,6 @@ _preview_url_cache: dict[str, str] = {}
 # --------------------------------------------------------------------------- #
 
 PRODUCT = "rpmap"
-APP_VERSION = "0.3.1"
 DEFAULT_PORT = 8787
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 
@@ -95,6 +94,31 @@ TAILNET = ipaddress.ip_network("100.64.0.0/10")
 GITHUB_REPO = "JThFr/rocket-league-workshop-map-swap"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+
+
+def _read_app_version() -> str:
+    """The version, from the repo's ``VERSION`` file (the single source of truth).
+
+    Packaged builds bundle ``VERSION`` next to the executable (``sys._MEIPASS``);
+    running from source reads it from the repo root. Falls back to ``0.0.0`` -
+    which disables the self-updater - if the file can't be found.
+    """
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(__file__).resolve().parents[1])
+    for root in roots:
+        try:
+            text = (root / "VERSION").read_text().strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    return "0.0.0"
+
+
+APP_VERSION = _read_app_version()
 
 
 def config_path() -> Path:
@@ -176,6 +200,8 @@ def _latest_release(timeout: float = 5.0) -> dict | None:
 
 def check_for_update() -> dict | None:
     """Return release info if GitHub publishes a newer tag, else None."""
+    if _version_tuple(APP_VERSION) == (0, 0, 0):
+        return None                       # unknown version (VERSION file missing)
     rel = _latest_release()
     if not rel:
         return None

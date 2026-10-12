@@ -84,12 +84,21 @@ the matching asset (`rpmap.exe` / `rpmap-x86_64.AppImage`) and replaces itself:
 Running from source (the `.py`) never self-updates — it only prints the available version.
 Skip the startup check with `--no-update-check`, or run it manually with `check-update`.
 
-## Building a release
+## Versioning & releases
 
-CI (`.github/workflows/release.yml`) builds both artifacts on a `v*` tag and attaches them to a
-GitHub release. The tag must match `APP_VERSION` in `scripts/rpmap.py`.
+The version lives in the repo's **`VERSION`** file — the single source of truth. The app reads it
+at runtime (packaged builds bundle it), so the UI header and the `version` command always match
+the release tag.
 
-Locally:
+Releases are automatic: a push/merge to `main` runs the `release` workflow, which reads `VERSION`
+and, if the tag `v<VERSION>` doesn't already exist, builds both binaries and creates a GitHub
+Release tagged `v<VERSION>`.
+
+**Bump `VERSION` in every PR** — a CI check (`version-check`) fails a pull request whose `VERSION`
+is not a valid increase over `main`, for example `0.3.1 → 0.3.2` (patch), `0.3.1 → 0.4.0` (minor),
+`0.4.0 → 1.0.0` (major).
+
+## Building locally
 
 ```bash
 scripts/build-appimage.sh      # Linux AppImage
@@ -99,8 +108,8 @@ scripts/build-appimage.sh      # Linux AppImage
 scripts\build-windows.ps1      # Windows .exe
 ```
 
-Both use PyInstaller (`--onefile --console`). The Linux AppImage wraps the binary in an AppDir
-(`assets/rpmap.desktop` + icon) with `appimagetool`.
+Both use PyInstaller (`--onefile --console`, bundling `VERSION`). The Linux AppImage wraps the
+binary in an AppDir (`assets/rpmap.desktop` + icon) with `appimagetool`.
 
 ## Tests
 

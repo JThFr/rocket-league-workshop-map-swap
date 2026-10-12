@@ -2,8 +2,6 @@ name: ci
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -19,21 +17,49 @@ jobs:
       - name: Unit + integration tests
         run: python -m unittest discover -s tests -v
 
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: VERSION must increase over main
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          new=$(tr -d '[:space:]' < VERSION)
+          old=$(git show "$BASE_SHA:VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+          [ -n "$old" ] || old=0.0.0
+          echo "base=$old  pr=$new"
+          echo "$new" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::VERSION '$new' is not MAJOR.MINOR.PATCH"; exit 1; }
+          python3 -c '
+          import sys
+          def t(v):
+              return tuple(int(p) for p in v.split("."))
+          old, new = t(sys.argv[1]), t(sys.argv[2])
+          if new <= old:
+              print("::error::VERSION must increase over main (%s -> %s)" % (sys.argv[1], sys.argv[2]))
+              sys.exit(1)
+          kind = next(l for l, a, b in zip(("major", "minor", "patch"), old, new) if a != b)
+          print("VERSION bump: %s (%s -> %s)" % (kind, sys.argv[1], sys.argv[2]))
+          ' "$old" "$new"
+
   build:
     uses: ./.github/workflows/build.yml
 
-  # A plain job in the caller workflow. Jobs inside a reusable workflow report
-  # as "<caller job> / <called job>", so their names move if the structure
-  # changes. This gate has a stable, prefix-free check name and only passes
-  # when the tests and both builds succeed - require this one in branch
-  # protection.
+  # Plain job in the caller workflow: its check name has no "<caller>/<job>"
+  # prefix (unlike the reusable workflow's jobs), so branch protection can
+  # require one stable check that only passes when tests, the version bump and
+  # both builds all succeed.
   gate:
-    needs: [test, build]
+    needs: [test, version-check, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs succeeded
         run: |
-          echo "test=${{ needs.test.result }}  build=${{ needs.build.result }}"
-          [ "${{ needs.test.result }}" = "success" ] || { echo "::error::tests did not pass"; exit 1; }
-          [ "${{ needs.build.result }}" = "success" ] || { echo "::error::a build did not pass"; exit 1; }
+          echo "test=${{ needs.test.result }}  version-check=${{ needs.version-check.result }}  build=${{ needs.build.result }}"
+          for r in "${{ needs.test.result }}" "${{ needs.version-check.result }}" "${{ needs.build.result }}"; do
+            [ "$r" = "success" ] || { echo "::error::a required job did not pass"; exit 1; }
+          done

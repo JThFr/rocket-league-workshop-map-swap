@@ -6,6 +6,6 @@ $root = Split-Path -Parent $PSScriptRoot   # scripts/ -> repo root
 Set-Location $root
 
 python -m pip install --upgrade pip pyinstaller
-python -m PyInstaller --onefile --console --name rpmap scripts/rpmap.py --noconfirm
+python -m PyInstaller --onefile --console --name rpmap --add-data "VERSION;." scripts/rpmap.py --noconfirm
 
 Write-Host "Built: $root\dist\rpmap.exe"
