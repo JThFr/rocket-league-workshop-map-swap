@@ -30,6 +30,7 @@ scripts/rpmap list
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
 | `python3 rpmap.py serve [--host H --port P] [--restore-on-exit]` | run the web UI / peer server |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
+| `python3 rpmap.py stop` | stop a running web UI (same as its Quit button) |
 | `python3 rpmap.py version` | print the version |
 | `python3 rpmap.py check-update` | check GitHub for a newer release |
 
@@ -46,13 +47,20 @@ Play:
 
 `--restore-on-exit` is a global flag (so it also works with the no-argument UI launch, e.g.
 `./rpmap-x86_64.AppImage --restore-on-exit`) and puts the stock map back when the program exits
-cleanly (Ctrl+C, or closing the terminal). The UI's "Restore stock map" button does it on demand.
+cleanly — quit from the UI (the header's **Quit** button), `rpmap stop`, Ctrl+C, or closing the
+terminal. The UI's "Restore stock map" button does it on demand.
 
 ## Web UI
 
 `python3 rpmap.py` starts a small local HTTP server and opens a browser page where you can
 browse maps, see the current slot, swap/restore, and (over Tailscale) view peers and sync
-switches. It prints a `127.0.0.1` URL with a token.
+switches. It prints a URL with a token.
+
+To stop it, use the header's **Quit** button or run `rpmap stop` from a terminal — handy after a
+self-update, when the AppImage relaunches detached with no terminal to Ctrl+C.
+
+Only **one** rpmap UI runs at a time: if you launch it again while one is already up, it reopens
+the running one instead of starting a second server.
 
 Every map gets a preview: the map's own image when it ships one, otherwise fetched once from
 Steam's public workshop API and cached.
@@ -84,6 +92,9 @@ Design notes: [`rpmap-phase2.md`](rpmap-phase2.md).
 - `RL_MAPS` — extra folder of `.udk`/`.upk` maps (default `~/maps`).
 - Per-user config lives in `%APPDATA%\rpmap\config.json` (Windows) or
   `~/.config/rpmap/config.json` (Linux); preview cache in the matching local cache dir.
+- While the UI is running it also writes `runtime.json` next to the config (mode `0600`, removed
+  on a clean exit) so `rpmap stop` and a second launch can find the live server. It holds this
+  run's UI token, which is regenerated every time the server starts.
 
 ## Updates
 
@@ -95,6 +106,9 @@ the matching asset (`rpmap.exe` / `rpmap-x86_64.AppImage`) and replaces itself:
 
 Running from source (the `.py`) never self-updates — it only prints the available version.
 Skip the startup check with `--no-update-check`, or run it manually with `check-update`.
+
+The relaunched build is detached (no terminal), so once it's up you stop it with the UI's
+**Quit** button or `rpmap stop` — not Ctrl+C.
 
 ## Versioning & releases
 

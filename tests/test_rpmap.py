@@ -10,10 +10,12 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -234,11 +236,12 @@ class HttpTests(_CookedFixture):
 
     def setUp(self) -> None:
         super().setUp()
+        self.quit_called = threading.Event()
         engine = {
             "cooked": self.cooked, "slot": "underpass", "token": self.TOKEN,
             "host": "127.0.0.1", "secret": "s3cr3t", "cfg": {},
             "ident": {"peer_id": "tester", "name": "tester", "ips": [], "dns": ""},
-            "dev": False, "port": 0,
+            "dev": False, "port": 0, "request_quit": self.quit_called.set,
         }
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(engine))
         self.port = self.srv.server_address[1]
@@ -320,6 +323,29 @@ class HttpTests(_CookedFixture):
         _, body = self._req("GET", "/api/state?token=" + self.TOKEN)
         self.assertEqual(json.loads(body)["slot"]["state"], "stock")
 
+    def test_quit_requires_the_token(self):
+        self.assertEqual(self._req("POST", "/api/quit")[0], 403)
+
+    def test_quit_calls_the_injected_shutdown(self):
+        status, body = self._req("POST", "/api/quit?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertTrue(self.quit_called.wait(2), "request_quit was never called")
+
+    def test_running_instance_finds_the_live_server(self):
+        config.write_runtime({"pid": os.getpid(), "port": self.port,
+                              "token": self.TOKEN})
+        rec = web.running_instance()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["port"], self.port)
+        config.clear_runtime(os.getpid())
+
+    def test_running_instance_ignores_a_stale_record(self):
+        config.write_runtime({"pid": 10_000_000, "port": self.port,
+                              "token": self.TOKEN})
+        self.assertIsNone(web.running_instance())
+        config.clear_runtime(10_000_000)
+
 
 class EveryoneFilterTests(unittest.TestCase):
     """Two servers with different inventories; one sees the other as a peer."""
@@ -373,6 +399,108 @@ class EveryoneFilterTests(unittest.TestCase):
         self.assertEqual(set(data["common"]), {"n:shared:6", "n:only1:5"})
         local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
         self.assertEqual(local_keys & set(data["common"]), {"n:shared:6"})
+
+
+class QuitGateTests(unittest.TestCase):
+    """/api/quit is loopback-only; the gate is a plain predicate on the peer."""
+
+    def _handler(self):
+        return web.make_handler({"cooked": Path("."), "slot": "underpass",
+                                 "token": "t", "host": "127.0.0.1", "secret": "s",
+                                 "cfg": {}, "ident": {}, "dev": False, "port": 0})
+
+    def test_loopback_is_allowed(self):
+        class _Conn:
+            client_address = ("127.0.0.1", 51234)
+        self.assertTrue(self._handler()._local_ok(_Conn()))
+
+    def test_tailnet_peer_is_refused(self):
+        class _Conn:
+            client_address = ("100.64.0.7", 51234)
+        self.assertFalse(self._handler()._local_ok(_Conn()))
+
+
+class RuntimeFileTests(unittest.TestCase):
+    """The runtime record: round-trip, permissions, pid-guarded removal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="rpmap-runtime-")
+        self._old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self.tmp.name
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old
+        self.tmp.cleanup()
+
+    def test_missing_file_reads_as_empty(self):
+        self.assertEqual(config.read_runtime(), {})
+
+    def test_roundtrip_and_permissions(self):
+        config.write_runtime({"pid": os.getpid(), "port": 8787, "token": "abc"})
+        rec = config.read_runtime()
+        self.assertEqual(rec["port"], 8787)
+        self.assertEqual(rec["token"], "abc")
+        if os.name != "nt":
+            mode = stat.S_IMODE(os.stat(config.runtime_path()).st_mode)
+            self.assertEqual(mode, 0o600)
+        config.clear_runtime(os.getpid())
+        self.assertEqual(config.read_runtime(), {})
+
+    def test_clear_keeps_another_instances_record(self):
+        config.write_runtime({"pid": os.getpid(), "port": 1})
+        config.clear_runtime(10_000_000)          # a different (dead) pid
+        self.assertEqual(config.read_runtime()["port"], 1)
+
+    def test_pid_alive(self):
+        self.assertTrue(config.pid_alive(os.getpid()))
+        self.assertFalse(config.pid_alive(10_000_000))
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class ServerLifecycleTests(_CookedFixture):
+    """A real run_server: writes the runtime file, /api/quit stops it cleanly."""
+
+    def test_quit_stops_the_server_and_clears_runtime(self):
+        port = _free_port()
+        old_ident = web.local_identity
+        web.local_identity = lambda cfg: {"peer_id": "t", "name": "t",
+                                          "ips": [], "dns": ""}
+        try:
+            thread = threading.Thread(
+                target=web.run_server,
+                args=(self.cooked, "underpass", "127.0.0.1", port, False),
+                kwargs={"secret": "s3cr3t"}, daemon=True)
+            thread.start()
+
+            rec = {}
+            for _ in range(100):                  # wait for run_server to bind
+                rec = config.read_runtime()
+                if rec.get("port") and rec.get("pid") == os.getpid():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(rec.get("port"), "run_server never wrote the runtime file")
+
+            conn = http.client.HTTPConnection("127.0.0.1", rec["port"], timeout=5)
+            conn.request("POST", "/api/quit?token=" + rec["token"])
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(json.loads(resp.read())["ok"])
+            conn.close()
+
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "the server did not stop")
+            self.assertEqual(config.read_runtime(), {})
+        finally:
+            web.local_identity = old_ident
 
 
 if __name__ == "__main__":

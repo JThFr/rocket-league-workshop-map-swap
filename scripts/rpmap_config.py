@@ -105,6 +105,79 @@ def new_secret() -> str:
     return "-".join(h[i:i + 4] for i in range(0, 16, 4))
 
 
+# --------------------------------------------------------------------------- #
+# Runtime file (the live instance: `rpmap stop`, reopen the UI, single instance)
+# --------------------------------------------------------------------------- #
+#
+# A running server records {pid, port, host, token, version, started} next to
+# the config while it is up, and removes it on a clean exit. The token is the
+# ephemeral UI token for *this* run (it still changes on every restart); writing
+# it down is what lets the launcher reopen the existing UI and lets `stop` ask
+# this exact process to quit instead of starting a second server.
+
+def runtime_path() -> Path:
+    return config_path().with_name("runtime.json")
+
+
+def read_runtime() -> dict:
+    try:
+        data = json.loads(runtime_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_runtime(data: dict) -> None:
+    p = runtime_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2))
+    if os.name != "nt":
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+
+
+def clear_runtime(pid: int | None = None) -> None:
+    """Remove the runtime file, but only if it still belongs to ``pid``.
+
+    The guard stops a newer instance from deleting the record it just wrote
+    when an older one finishes shutting down.
+    """
+    if pid is not None and read_runtime().get("pid") not in (None, pid):
+        return
+    try:
+        runtime_path().unlink()
+    except OSError:
+        pass
+
+
+def pid_alive(pid: int) -> bool:
+    """Is ``pid`` a live process? (``os.kill(pid, 0)`` is a kill on Windows.)"""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) \
+                and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
 
 # --------------------------------------------------------------------------- #
 # TLS trust store (self-update)

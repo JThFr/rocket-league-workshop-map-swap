@@ -13,13 +13,16 @@ import socket
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
-                          TAILNET, load_config, new_secret, save_config)
+                          TAILNET, clear_runtime, load_config, new_secret,
+                          pid_alive, read_runtime, save_config, write_runtime)
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
@@ -108,6 +111,7 @@ PAGE = r"""<!doctype html>
   <span class="muted" id="verLabel"></span>
   <span class="grow"></span>
   <span class="muted" id="pathLabel"></span>
+  <button class="danger" id="quitBtn" onclick="quitApp()" title="Stop the rpmap server">Quit</button>
 </header>
 <main>
   <section class="hero" id="hero">
@@ -165,6 +169,7 @@ PAGE = r"""<!doctype html>
 <div class="toast" id="toast"></div>
 <script>
 let STATE = null;
+let TIMERS = [];        // poll intervals, cleared when the user quits
 let COMMON = null;      // map keys that every reachable peer has, or null
 let ARENA = 'the arena';
 let ARENA_NOTE = '';
@@ -272,6 +277,17 @@ async function restore(){
   const j = await (await api('/api/restore',{method:'POST'})).json();
   toast(j.ok ? 'Stock map restored' : ('Error: ' + (j.error||'failed')));
   load_state();
+}
+async function quitApp(){
+  if(!confirm('Stop rpmap?\n\nThe server will shut down and this tab can be closed.')) return;
+  try{ await api('/api/quit', {method:'POST'}); }catch(e){}
+  TIMERS.forEach(clearInterval);
+  document.body.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
+    'color:#c9d1d9;font:15px system-ui,Segoe UI,Roboto,sans-serif;text-align:center">' +
+    '<div><div style="font-size:34px">&#128075;</div>' +
+    '<h2 style="color:#f0f6fc;margin:.3em 0">rpmap stopped</h2>' +
+    '<p style="color:#8b949e">The server is off. You can close this tab.</p></div></div>';
 }
 
 let SESSION = null;
@@ -398,8 +414,8 @@ function syncTo(id){ const p=findPeer(id); if(p) doSync('push', [peerTarget(p)])
 function syncAll(){ doSync('push', (PEERS||[]).filter(p=>p.rpmap).map(peerTarget)); }
 
 load_state(); loadSession(); loadPeers();
-setInterval(load_state, 4000);
-setInterval(loadPeers, 8000);
+TIMERS.push(setInterval(load_state, 4000));
+TIMERS.push(setInterval(loadPeers, 8000));
 </script>
 </body></html>
 """
@@ -461,6 +477,17 @@ def make_handler(engine: dict):
 
         def _host_ok(self) -> bool:
             return (self.headers.get("Host") or "").split(":")[0] in allowed_hosts
+
+        def _local_ok(self) -> bool:
+            """True only for a loopback client - used to gate quitting.
+
+            A tailnet peer can reach the API, but must never be able to stop
+            this machine's server.
+            """
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                return False
 
         def do_GET(self):
             if not self._source_ok():
@@ -540,6 +567,14 @@ def make_handler(engine: dict):
                     return self._json(use_map(cooked, slot, Path(mp["path"])))
                 if u.path == "/api/restore":
                     return self._json(restore_slot(cooked, slot))
+                if u.path == "/api/quit":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    self._json({"ok": True})
+                    quit_fn = engine.get("request_quit")
+                    if quit_fn:
+                        threading.Thread(target=quit_fn, daemon=True).start()
+                    return
                 if u.path == "/api/session":
                     new = str(payload.get("secret") or "").strip() or new_secret()
                     engine["secret"] = new
@@ -584,7 +619,7 @@ class _HttpServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def _open_browser(url: str) -> None:
+def open_browser(url: str) -> None:
     """Open ``url`` in the default browser.
 
     PyInstaller puts its bundled libs on ``LD_LIBRARY_PATH``; if a desktop
@@ -604,6 +639,63 @@ def _open_browser(url: str) -> None:
             except OSError:
                 pass
     webbrowser.open(url)
+
+
+def _ui_host(host: str | None) -> str:
+    """A concrete address to reach a server bound to ``host`` from this machine."""
+    host = str(host or "")
+    return "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+
+
+def running_instance() -> dict | None:
+    """The live rpmap UI's runtime record, or None.
+
+    A record counts as live only when its pid is still running *and* the server
+    answers ``/api/capabilities`` - so a stale file (crash, reboot) is ignored.
+    """
+    rec = read_runtime()
+    pid = rec.get("pid")
+    port = rec.get("port")
+    if not pid or not port or not pid_alive(int(pid)):
+        return None
+    token = quote(str(rec.get("token") or ""), safe="")
+    url = (f"http://{_ui_host(rec.get('host'))}:{int(port)}"
+           f"/api/capabilities?token={token}")
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as r:
+            caps = json.loads(r.read())
+    except Exception:
+        return None
+    return rec if caps.get("product") == PRODUCT else None
+
+
+def stop_instance() -> bool:
+    """Ask a running rpmap UI to quit; fall back to SIGTERM. False if none."""
+    rec = read_runtime()
+    pid = rec.get("pid")
+    if not pid or not pid_alive(int(pid)):
+        return False
+    port, token = rec.get("port"), str(rec.get("token") or "")
+    if port:
+        url = (f"http://{_ui_host(rec.get('host'))}:{int(port)}"
+               f"/api/quit?token={quote(token, safe='')}")
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=2.0) as r:
+                if json.loads(r.read()).get("ok"):
+                    return True
+        except Exception:
+            pass
+    try:                     # last resort; on Windows this skips restore-on-exit
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def ui_url(rec: dict) -> str:
+    return f"http://{_ui_host(rec.get('host'))}:{int(rec['port'])}/?token={rec.get('token') or ''}"
 
 
 def _install_stop_signals() -> None:
@@ -637,7 +729,7 @@ def _restore_on_exit(cooked: Path, slot: str) -> None:
         print(f"could not restore the stock map on exit: {e}", file=sys.stderr)
 
 
-def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool,
+def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
                secret: str | None = None, dev: bool = False,
                restore_on_exit: bool = False) -> int:
     cfg = load_config()
@@ -651,13 +743,15 @@ def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool
     ident = local_identity(cfg)
     token = secrets.token_urlsafe(16)
     actual = _find_port(port) if host == "127.0.0.1" else port
-    httpd = _HttpServer((host, actual),
-                        make_handler({"cooked": cooked, "slot": slot,
-                                      "token": token, "host": host,
-                                      "secret": cfg["session_secret"],
-                                      "cfg": cfg, "ident": ident,
-                                      "dev": dev, "port": actual}))
-    url = f"http://127.0.0.1:{actual}/?token={token}"
+    engine = {"cooked": cooked, "slot": slot, "token": token, "host": host,
+              "secret": cfg["session_secret"], "cfg": cfg, "ident": ident,
+              "dev": dev, "port": actual}
+    httpd = _HttpServer((host, actual), make_handler(engine))
+    engine["request_quit"] = httpd.shutdown          # POST /api/quit -> stop cleanly
+    write_runtime({"pid": os.getpid(), "port": actual, "host": host,
+                   "token": token, "version": APP_VERSION,
+                   "started": int(time.time())})
+    url = f"http://{_ui_host(host)}:{actual}/?token={token}"
     print(f"rpmap UI  ->  {url}", flush=True)
     print(f"slot: {SLOTS[slot][0]}   cooked: {cooked}", flush=True)
     print(f"peer: {ident['name']} ({ident['peer_id']})", flush=True)
@@ -666,15 +760,18 @@ def run_server(cooked: Path, slot: str, host: str, port: int, open_browser: bool
         print("hint: for peer sync run:  serve --host <tailscale-ip>", flush=True)
     else:
         print(f"note: bound to {host}; peers reach this on port {actual}", flush=True)
-    if open_browser:
-        threading.Thread(target=lambda: _open_browser(url), daemon=True).start()
+    print("quit:  the UI's Quit button, or `rpmap stop`", flush=True)
+    if auto_open:
+        threading.Thread(target=lambda: open_browser(url), daemon=True).start()
     _install_stop_signals()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
+        pass
     finally:
+        clear_runtime(os.getpid())
         if restore_on_exit:
             _restore_on_exit(cooked, slot)
         httpd.server_close()
+        print("bye", flush=True)
     return 0
