@@ -92,6 +92,37 @@ class UpdateTests(unittest.TestCase):
         self.assertIsNone(rpmap._update_target())
 
 
+class CaBundleTests(unittest.TestCase):
+    """The packaged build must be able to find a CA bundle for TLS."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("SSL_CERT_FILE", None)
+        self._orig = rpmap.CA_BUNDLE_CANDIDATES
+
+    def tearDown(self):
+        rpmap.CA_BUNDLE_CANDIDATES = self._orig
+        if self._saved is None:
+            os.environ.pop("SSL_CERT_FILE", None)
+        else:
+            os.environ["SSL_CERT_FILE"] = self._saved
+
+    @unittest.skipIf(os.name == "nt", "POSIX CA-bundle fallback")
+    def test_picks_the_first_existing_bundle(self):
+        with tempfile.TemporaryDirectory() as d:
+            good = Path(d) / "ca.pem"
+            good.write_text("x")
+            rpmap.CA_BUNDLE_CANDIDATES = (str(Path(d) / "missing.pem"), str(good))
+            self.assertEqual(rpmap.ensure_ca_bundle(), str(good))
+            self.assertEqual(os.environ.get("SSL_CERT_FILE"), str(good))
+
+    @unittest.skipIf(os.name == "nt", "POSIX CA-bundle fallback")
+    def test_respects_an_existing_setting(self):
+        os.environ["SSL_CERT_FILE"] = "/custom/ca.pem"
+        rpmap.CA_BUNDLE_CANDIDATES = ("/etc/ssl/certs/ca-certificates.crt",)
+        self.assertIsNone(rpmap.ensure_ca_bundle())
+        self.assertEqual(os.environ["SSL_CERT_FILE"], "/custom/ca.pem")
+
+
 class SlotTests(_CookedFixture):
     def test_slot_reports_stock_when_backup_matches(self):
         (self.cooked / (SLOT_FILE + ".orig")).write_bytes(b"STOCK")

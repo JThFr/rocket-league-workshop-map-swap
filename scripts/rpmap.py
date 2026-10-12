@@ -167,6 +167,38 @@ def new_secret() -> str:
 # Self-update (GitHub releases)
 # --------------------------------------------------------------------------- #
 
+# System CA bundles to fall back on (POSIX), in preference order.
+CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",                 # Debian/Ubuntu, Fedora symlink
+    "/etc/pki/tls/certs/ca-bundle.crt",                   # RHEL/Fedora (traditional)
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # RHEL/Fedora (ca-trust)
+    "/etc/ssl/cert.pem",                                  # Alpine
+    "/usr/local/etc/openssl/cert.pem",                    # macOS (Homebrew)
+)
+
+
+def ensure_ca_bundle() -> str | None:
+    """Point Python's TLS at the system CA bundle if it can't find one itself.
+
+    A packaged build ships its own OpenSSL, whose compiled-in default CA path
+    usually does not exist inside the bundle (seen on Fedora/Bazzite). Every
+    HTTPS request then fails certificate verification, and because the update
+    check treats *any* error as "no update", self-update silently never fires.
+    ``SSL_CERT_FILE`` is read when the default TLS context is created, so
+    setting it early fixes both the release check and the download.
+    """
+    if os.name == "nt" or os.environ.get("SSL_CERT_FILE"):
+        return None                       # Windows uses its own trust store
+    for path in CA_BUNDLE_CANDIDATES:
+        if os.path.isfile(path):
+            os.environ["SSL_CERT_FILE"] = path
+            return path
+    return None
+
+
+ensure_ca_bundle()
+
+
 def _is_frozen() -> bool:
     """True when running from a packaged build rather than the .py source."""
     return bool(getattr(sys, "frozen", False))
