@@ -323,6 +323,25 @@ def find_map_by(cooked: Path, workshop_id=None, name=None, sha256=None) -> dict 
     return None
 
 
+def map_key(m: dict) -> str:
+    """A stable identity for a map, shared by the local grid and peer inventories.
+
+    Workshop maps use their published file id; anything else falls back to
+    lowercased name + size. Deliberately cheap - no hashing of multi-GB files -
+    which is good enough for the "everyone already has it" filter.
+    """
+    wid = str(m.get("workshop_id") or "")
+    if wid:
+        return f"w:{wid}"
+    return f"n:{(m.get('name') or '').lower()}:{m.get('size') or 0}"
+
+
+def map_inventory(cooked: Path) -> list[dict]:
+    """A compact list of the maps this machine has, for peers to intersect."""
+    return [{"key": map_key(m), "name": m["name"], "size": m["size"],
+             "workshop_id": m.get("workshop_id")} for m in list_maps(cooked)]
+
+
 # --------------------------------------------------------------------------- #
 # Slot state / actions
 # --------------------------------------------------------------------------- #

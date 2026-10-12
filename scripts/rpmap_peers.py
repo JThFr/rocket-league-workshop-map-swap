@@ -91,7 +91,10 @@ def _http_get_json_auth(url: str, secret: str, timeout: float = 2.0) -> dict:
 
 
 def probe_peer(ip: str | None, port: int, secret: str, timeout: float = 2.0) -> dict | None:
-    """Return {'caps':..., 'state':...} if the peer speaks rpmap, else None."""
+    """Return {'caps', 'state', 'maps'} if the peer speaks rpmap, else None.
+
+    ``maps`` is the peer's inventory (or None if it predates ``/api/maps``).
+    """
     if not ip:
         return None
     base = f"http://{ip}:{port}"
@@ -102,7 +105,23 @@ def probe_peer(ip: str | None, port: int, secret: str, timeout: float = 2.0) -> 
         state = _http_get_json_auth(f"{base}/api/state", secret, timeout)
     except Exception:
         return None
-    return {"caps": caps, "state": state}
+    try:
+        maps = _http_get_json_auth(f"{base}/api/maps", secret, timeout).get("maps")
+    except Exception:
+        maps = None                       # older peer: no inventory endpoint
+    return {"caps": caps, "state": state, "maps": maps}
+
+
+def common_map_keys(key_sets: list[set[str] | None]) -> list[str] | None:
+    """Map keys present in every given set (peers we could actually query).
+
+    Returns None when there is nothing to intersect (no reachable rpmap peer),
+    which the UI treats as "filter unavailable".
+    """
+    sets = [set(s) for s in key_sets if s is not None]
+    if not sets:
+        return None
+    return sorted(set.intersection(*sets))
 
 
 def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> dict:
@@ -111,6 +130,7 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> 
         "peer_id": p.get("peer_id"), "name": p.get("name"), "ip": p.get("ip"),
         "online": bool(p.get("online")), "rpmap": False, "port": pport,
         "slot": None, "sha256": None, "in_sync": "unknown", "version": None,
+        "map_count": None,
     }
     if not got:
         return row
@@ -149,7 +169,17 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
                     got = fut.result()
                 except Exception:
                     got = None
-                roster.append(_peer_row(futs[fut], port, got, local_hash))
+                row = _peer_row(futs[fut], port, got, local_hash)
+                row["_keys"] = ({e["key"] for e in got["maps"] if e.get("key")}
+                                if got and got.get("maps") is not None else None)
+                roster.append(row)
+
+    # "Everyone" = reachable rpmap peers we could actually query for an inventory.
+    contributors = [r["_keys"] for r in roster if r.get("rpmap") and r["_keys"] is not None]
+    common = common_map_keys(contributors)
+    for r in roster:
+        r["map_count"] = len(r["_keys"]) if r["_keys"] is not None else None
+        r.pop("_keys", None)
     roster.sort(key=lambda r: (r.get("name") or ""))
 
     return {
@@ -163,6 +193,7 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
             "sha256": local_hash or None,
         },
         "peers": roster,
+        "common": common,
     }
 
 
