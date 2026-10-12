@@ -68,7 +68,8 @@ configuration, updates, and how to build the binaries — is documented in
 - Keep the **same map file on every player** (a mismatch = content mismatch / crash).
 - **Restore the stock map before playing online** if your slot arena is one that online uses
   (Arcade/LTM rotates Rocket Labs arenas). The UI's "Restore stock map" button does this, and
-  `--restore-on-exit` does it automatically when you quit.
+  `--restore-on-exit` does it automatically when you quit (the UI's **Quit** button, or
+  `rpmap stop`).
 - The stock map is backed up next to the slot (e.g. `Labs_Utopia_P.upk.orig`); the tools also
   recognise the `ORIGINAL_*.upk` names other loaders use.
 - A pure file swap is not injection, but Rocket League mods generally want a **no-EAC

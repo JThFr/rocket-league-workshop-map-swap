@@ -29,6 +29,7 @@ Usage:
   python3 rpmap.py session [--new]      # show or rotate the shared session code
   python3 rpmap.py join <code>          # save a session code shared by a peer
   python3 rpmap.py name <display>       # set the name peers see
+  python3 rpmap.py stop                 # stop a running UI (or use its Quit button)
   python3 rpmap.py version              # print the version
   python3 rpmap.py check-update         # check GitHub for a newer release
 
@@ -55,7 +56,8 @@ from rpmap_maps import (detect_cooked, fetch_host_map, host_status, install_map,
                         list_maps, resolve_map, restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity
 from rpmap_update import check_for_update, maybe_self_update
-from rpmap_web import run_server
+from rpmap_web import (open_browser, running_instance, run_server, stop_instance,
+                       ui_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     p_jn.add_argument("code")
     p_nm = sub.add_parser("name", help="set the display name peers see")
     p_nm.add_argument("value")
+    sub.add_parser("stop", help="stop a running rpmap UI")
     sub.add_parser("version", help="print the version")
     sub.add_parser("check-update", help="check GitHub for a newer release")
 
@@ -149,6 +152,13 @@ def main(argv: list[str] | None = None) -> int:
         print("display name:", cfg.get("display_name") or "(unset)")
         return 0
 
+    if args.cmd == "stop":
+        if stop_instance():
+            print("stopping the running rpmap UI")
+            return 0
+        print("rpmap is not running")
+        return 0
+
     if args.cmd == "version":
         print(f"{PRODUCT} {APP_VERSION}")
         return 0
@@ -160,6 +170,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"{PRODUCT} {APP_VERSION}: up to date (no newer release found)")
         return 0
+
+    if args.cmd in (None, "serve"):
+        live = running_instance()
+        if live:
+            url = ui_url(live)
+            print(f"rpmap is already running (pid {live['pid']}) -> {url}")
+            if not getattr(args, "no_browser", False):
+                open_browser(url)
+            return 0
 
     if args.cmd in (None, "serve") and not args.no_update_check:
         maybe_self_update(auto=True)
