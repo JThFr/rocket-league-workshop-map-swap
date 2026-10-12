@@ -2,7 +2,8 @@
 
 **`rpmap`** — a helper to play **custom / workshop maps with friends in a Rocket League
 multiplayer lobby**, across **Linux and Windows**, without restarting the game every time the
-map changes. One Python 3 script, standard library only.
+map changes. Shipped as ready-to-run binaries; built from a single Python 3 script with no
+dependencies.
 
 ## Why this exists
 
@@ -26,9 +27,8 @@ in the way, and this tool exists to smooth them out:
 
 1. **Slot swap (no restart).** Rocket League loads a stock arena package whenever you pick
    that arena. Overwrite that one file and the game loads your map — no plugin, no restart.
-   The default slot is **Utopia Retro** (`Labs_Utopia_P.upk`), which isn't used in any online
-   playlist; **Underpass** (`Labs_Underpass_P.upk`, used in Rumble) is also available via
-   `--slot underpass`. `rpmap` backs up the stock file and swaps maps in and out.
+   `rpmap` backs up the stock file and swaps maps in and out; which arena slot it uses is
+   configurable (see [docs/usage.md](docs/usage.md)).
 2. **Rocket Plugin staging.** Copy maps into `CookedPCConsole/{mods,rocketplugin}` so Rocket
    Plugin sees them without its "Copy Map and Restart" step.
 3. **Peer sync (reference-only).** Peers on a Tailscale tailnet see what map each other has
@@ -47,9 +47,12 @@ Or run it from source — it's one script, standard library only.
 
 ## Requirements
 
-- **Python 3** (standard library only — no `pip install` needed).
-- Rocket League installed via **Steam** (auto-detected; see
+- **Rocket League** installed via **Steam** (auto-detected; see
   [docs/usage.md](docs/usage.md) to override the game path).
+- **Windows 10/11** or a **Linux** desktop. The AppImage needs FUSE; it runs as-is on atomic
+  distros like Bazzite.
+- Running from **source** instead? Then you also need **Python 3** (standard library only —
+  no `pip install`).
 
 ## Usage
 
@@ -59,14 +62,13 @@ configuration, updates, and how to build the binaries — is documented in
 
 ## The swap, and the rules
 
-- In Free Play / Custom Games, pick the arena that matches your **slot**. The default is
-  **Utopia Retro** (not used in online playlists); `--slot underpass` uses **Underpass**
-  (which **is** used in Rumble — not "Tokyo Underpass").
+- In Free Play / Custom Games, pick the arena that matches your **slot**. The default is a
+  Rocket Labs arena that online playlists don't use; the slot is configurable — see
+  [docs/usage.md](docs/usage.md) for the arena names.
 - Keep the **same map file on every player** (a mismatch = content mismatch / crash).
 - **Restore the stock map before playing online** if your slot arena is one that online uses
-  (Underpass is; Utopia Retro isn't — but Arcade/LTM rotates Rocket Labs arenas). The UI's
-  "Restore stock map" button does this, and `--restore-on-exit` does it automatically when you
-  quit.
+  (Arcade/LTM rotates Rocket Labs arenas). The UI's "Restore stock map" button does this, and
+  `--restore-on-exit` does it automatically when you quit.
 - The stock map is backed up next to the slot (e.g. `Labs_Utopia_P.upk.orig`); the tools also
   recognise the `ORIGINAL_*.upk` names other loaders use.
 - A pure file swap is not injection, but Rocket League mods generally want a **no-EAC
