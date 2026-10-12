@@ -20,7 +20,8 @@ from urllib.parse import urlparse, parse_qs
 
 from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
                           TAILNET, load_config, new_secret, save_config)
-from rpmap_maps import get_preview_bytes, list_maps, restore_slot, slot_state, use_map
+from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
+                        restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
 
 
@@ -128,6 +129,9 @@ PAGE = r"""<!doctype html>
 
   <div class="row" style="margin-bottom:12px">
     <input class="search" id="search" placeholder="Filter maps..." oninput="render()">
+    <label class="muted" id="everyoneLabel" title="Show only maps that every reachable peer running rpmap already has">
+      <input type="checkbox" id="everyoneOnly" onchange="render()"> Only maps everyone has
+    </label>
     <span class="muted" id="count"></span>
     <span class="grow"></span>
     <button onclick="load_state()">Refresh</button>
@@ -161,6 +165,7 @@ PAGE = r"""<!doctype html>
 <div class="toast" id="toast"></div>
 <script>
 let STATE = null;
+let COMMON = null;      // map keys that every reachable peer has, or null
 let ARENA = 'the arena';
 let ARENA_NOTE = '';
 const token = new URLSearchParams(location.search).get('token') || '';
@@ -232,8 +237,13 @@ function render(){
   }
 
   const q = (document.getElementById('search').value||'').toLowerCase();
-  const maps = (STATE.maps||[]).filter(m => !q || m.name.toLowerCase().includes(q));
-  document.getElementById('count').textContent = maps.length + ' map(s)';
+  const onlyBox = document.getElementById('everyoneOnly');
+  const commonSet = Array.isArray(COMMON) ? new Set(COMMON) : null;
+  onlyBox.disabled = !commonSet;
+  let maps = (STATE.maps||[]).filter(m => !q || m.name.toLowerCase().includes(q));
+  if (onlyBox.checked && commonSet) maps = maps.filter(m => commonSet.has(m.key));
+  document.getElementById('count').textContent = maps.length + ' map(s)'
+    + (onlyBox.checked && commonSet ? ' \u00b7 everyone has' : '');
   document.getElementById('grid').innerHTML = maps.map(m => {
     const active = s.map_id && s.map_id === m.id;
     return `<div class="card${active?' is-active':''}">
@@ -332,6 +342,7 @@ async function loadPeers(){
   PEERS = P.peers || [];
   const self = P.self || {};
   SELF_VER = self.version || '';
+  COMMON = Array.isArray(P.common) ? P.common : null;
   const rows = [ peerRow({name:self.name, ip:self.ip, online:true, slot:self.slot,
                           sha256:self.sha256, version:self.version, in_sync:'same'}, true) ];
   PEERS.forEach(p => rows.push(peerRow(p, false)));
@@ -344,7 +355,9 @@ async function loadPeers(){
   document.getElementById('peersEmpty').style.display = n ? 'none' : 'block';
   let status = n ? (same + '/' + n + ' in sync') : 'no peers';
   if(vdiff) status += ' \u00b7 ' + vdiff + ' on a different rpmap version';
+  if(COMMON) status += ' \u00b7 ' + COMMON.length + ' map(s) everyone has';
   document.getElementById('peersStatus').textContent = status;
+  render();   // refresh the "everyone has" filter availability/count
 }
 function peerTarget(p){ return {ip:p.ip, port:p.port, name:p.name}; }
 function findPeer(id){ return (PEERS||[]).find(x => x.peer_id===id); }
@@ -466,10 +479,14 @@ def make_handler(engine: dict):
                 return self._json({"error": "bad token"}, 403)
 
             if u.path == "/api/state":
-                return self._json({"cooked": str(cooked), "maps": list_maps(cooked),
+                return self._json({"cooked": str(cooked),
+                                   "maps": [dict(m, key=map_key(m)) for m in list_maps(cooked)],
                                    "slot": slot_state(cooked, slot),
                                    "peer": {"peer_id": ident.get("peer_id"),
                                             "name": ident.get("name")}})
+
+            if u.path == "/api/maps":
+                return self._json({"maps": map_inventory(cooked)})
 
             if u.path == "/api/capabilities":
                 st = slot_state(cooked, slot)

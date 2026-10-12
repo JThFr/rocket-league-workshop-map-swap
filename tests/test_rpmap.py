@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import rpmap_config as config
 import rpmap_maps as maps
+import rpmap_peers as peers
 import rpmap_update as update
 import rpmap_web as web
 
@@ -124,6 +125,18 @@ class CaBundleTests(unittest.TestCase):
         self.assertEqual(os.environ["SSL_CERT_FILE"], "/custom/ca.pem")
 
 
+class PeerTests(unittest.TestCase):
+    def test_common_map_keys(self):
+        self.assertEqual(peers.common_map_keys([{"a", "b"}, {"b", "c"}]), ["b"])
+
+    def test_common_map_keys_with_nothing_to_intersect(self):
+        self.assertIsNone(peers.common_map_keys([]))
+        self.assertIsNone(peers.common_map_keys([None, None]))
+
+    def test_common_map_keys_ignores_peers_without_inventory(self):
+        self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
+
+
 class SlotTests(_CookedFixture):
     def test_slot_reports_stock_when_backup_matches(self):
         (self.cooked / (SLOT_FILE + ".orig")).write_bytes(b"STOCK")
@@ -201,6 +214,18 @@ class MapsTests(_CookedFixture):
         self.assertIsNotNone(m)
         self.assertEqual(m["name"], "TestMap")
 
+    def test_map_key_prefers_workshop_id(self):
+        self.assertEqual(maps.map_key({"workshop_id": "123", "name": "X", "size": 9}), "w:123")
+
+    def test_map_key_falls_back_to_name_and_size(self):
+        self.assertEqual(maps.map_key({"workshop_id": None, "name": "My Map", "size": 42}),
+                         "n:my map:42")
+
+    def test_map_inventory_entries_have_keys(self):
+        inv = maps.map_inventory(self.cooked)
+        self.assertIn("TestMap", {e["name"] for e in inv})
+        self.assertTrue(all("key" in e for e in inv))
+
 
 class HttpTests(_CookedFixture):
     """Drive the real HTTP server over a socket."""
@@ -259,6 +284,17 @@ class HttpTests(_CookedFixture):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["product"], "rpmap")
 
+    def test_api_maps_lists_inventory(self):
+        status, body = self._req("GET", "/api/maps?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        inv = json.loads(body)["maps"]
+        self.assertIn("TestMap", {e["name"] for e in inv})
+        self.assertTrue(all("key" in e for e in inv))
+
+    def test_state_maps_carry_a_key(self):
+        _, body = self._req("GET", "/api/state?token=" + self.TOKEN)
+        self.assertTrue(all("key" in m for m in json.loads(body)["maps"]))
+
     def test_unknown_host_is_rejected(self):
         status, _ = self._req("GET", "/api/state?token=" + self.TOKEN, host="evil.example")
         self.assertEqual(status, 403)
@@ -283,6 +319,60 @@ class HttpTests(_CookedFixture):
         self.assertEqual(status, 200)
         _, body = self._req("GET", "/api/state?token=" + self.TOKEN)
         self.assertEqual(json.loads(body)["slot"]["state"], "stock")
+
+
+class EveryoneFilterTests(unittest.TestCase):
+    """Two servers with different inventories; one sees the other as a peer."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="rpmap-everyone-")
+        root = Path(self._tmp.name)
+        self.cooked1 = root / "m1" / "TAGame" / "CookedPCConsole"
+        self.cooked2 = root / "m2" / "TAGame" / "CookedPCConsole"
+        for cooked, extra in ((self.cooked1, True), (self.cooked2, False)):
+            (cooked / "mods").mkdir(parents=True)
+            (cooked / "mods" / "Shared.upk").write_bytes(b"SHARED")
+            if extra:
+                (cooked / "mods" / "Only1.upk").write_bytes(b"ONLY1")
+        self.srv1 = self._serve(self.cooked1)
+
+    def _serve(self, cooked):
+        engine = {"cooked": cooked, "slot": "underpass", "token": "t",
+                  "host": "127.0.0.1", "secret": "s3cr3t", "cfg": {},
+                  "ident": {"peer_id": "x", "name": "x", "ips": [], "dns": ""},
+                  "dev": False, "port": 0}
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(engine))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def tearDown(self):
+        self.srv1.shutdown()
+        self.srv1.server_close()
+        self._tmp.cleanup()
+
+    def test_inventory_and_common(self):
+        p1 = self.srv1.server_address[1]
+
+        got = peers.probe_peer("127.0.0.1", p1, "s3cr3t")
+        self.assertIsNotNone(got)
+        self.assertEqual({e["name"] for e in got["maps"]}, {"Shared", "Only1"})
+
+        orig = peers.tailscale_peers
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": "m1", "name": "m1", "dns": "", "ip": "127.0.0.1",
+             "port": p1, "online": True, "os": "linux"}]
+        try:
+            data = peers.gather_peers(self.cooked2, "underpass",
+                                      {"session_secret": "s3cr3t"}, {})
+        finally:
+            peers.tailscale_peers = orig
+
+        # "everyone" = the peers' intersection (here, the single peer's whole
+        # inventory); the grid then intersects that with the maps this machine has.
+        self.assertEqual(data["peers"][0]["map_count"], 2)
+        self.assertEqual(set(data["common"]), {"n:shared:6", "n:only1:5"})
+        local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
+        self.assertEqual(local_keys & set(data["common"]), {"n:shared:6"})
 
 
 if __name__ == "__main__":
