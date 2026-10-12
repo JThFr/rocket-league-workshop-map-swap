@@ -35,6 +35,16 @@ in the way, and this tool exists to smooth them out:
    loaded (compared by `sha256`) and can push/pull a switch. No map bytes are transferred —
    each peer loads the map from its own copy.
 
+## Get it
+
+Packaged builds live on the [Releases](https://github.com/JThFr/rocket-league-workshop-map-swap/releases)
+page — no Python needed:
+
+- **Windows:** `rpmap.exe` (portable, single file)
+- **Linux:** `rpmap-x86_64.AppImage` (runs on atomic distros like Bazzite with no install)
+
+Or run it from source — it's one script, standard library only (see below).
+
 ## Requirements
 
 - **Python 3** (the script uses only the standard library — no `pip install` needed).
@@ -70,6 +80,8 @@ On Windows: `python rpmap.py <command>` (same arguments).
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
 | `python3 rpmap.py serve [--host H --port P]` | run the web UI / peer server |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
+| `python3 rpmap.py version` | print the version |
+| `python3 rpmap.py check-update` | check GitHub for a newer release |
 
 ### Web UI
 
@@ -112,6 +124,46 @@ reference-only — anything obtained outside the Steam Workshop syncs only if th
 has the byte-identical file. Never swap during an online match.
 
 Design notes: [`docs/rpmap-phase2.md`](docs/rpmap-phase2.md).
+
+## Updates
+
+A packaged build checks GitHub Releases **on startup**. If a newer version exists it downloads
+the matching asset (`rpmap.exe` / `rpmap-x86_64.AppImage`) and replaces itself:
+
+- **Windows:** a tiny helper waits for the process to exit, swaps the `.exe`, and relaunches.
+- **Linux (AppImage or binary):** the file is replaced in place and the new build is started.
+
+Running from source (the `.py`) never self-updates — it only prints the available version.
+Skip the startup check with `--no-update-check`, or run it manually with `check-update`.
+
+## Building a release
+
+CI (`.github/workflows/release.yml`) builds both artifacts on a `v*` tag and attaches them to a
+GitHub release. The tag must match `APP_VERSION` in `scripts/rpmap.py`.
+
+Locally:
+
+```bash
+scripts/build-appimage.sh      # Linux AppImage
+```
+
+```powershell
+scripts\build-windows.ps1      # Windows .exe
+```
+
+Both use PyInstaller (`--onefile --console`). The Linux AppImage wraps the binary in an AppDir
+(`assets/rpmap.desktop` + icon) with `appimagetool`.
+
+## Tests
+
+Standard library only:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+CI (`.github/workflows/ci.yml`) runs these plus the Windows and Linux builds on every pull
+request; all checks must pass before merging to `main`.
 
 ## Configuration
 

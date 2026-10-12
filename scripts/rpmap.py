@@ -27,6 +27,8 @@ Usage:
   python3 rpmap.py session [--new]      # show or rotate the shared session code
   python3 rpmap.py join <code>          # save a session code shared by a peer
   python3 rpmap.py name <display>       # set the name peers see
+  python3 rpmap.py version              # print the version
+  python3 rpmap.py check-update         # check GitHub for a newer release
 
 Env:
   RL_COOKED   override the CookedPCConsole path
@@ -85,9 +87,14 @@ _preview_url_cache: dict[str, str] = {}
 # --------------------------------------------------------------------------- #
 
 PRODUCT = "rpmap"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 DEFAULT_PORT = 8787
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+# Where the packaged builds live (used only by the self-updater).
+GITHUB_REPO = "JThFr/rocket-league-workshop-map-swap"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
 
 def config_path() -> Path:
@@ -121,6 +128,160 @@ def new_secret() -> str:
     h = secrets.token_hex(8)
     return "-".join(h[i:i + 4] for i in range(0, 16, 4))
 
+
+
+# --------------------------------------------------------------------------- #
+# Self-update (GitHub releases)
+# --------------------------------------------------------------------------- #
+
+def _is_frozen() -> bool:
+    """True when running from a packaged build rather than the .py source."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", text or "")
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def _update_asset_name() -> str:
+    return "rpmap.exe" if os.name == "nt" else "rpmap-x86_64.AppImage"
+
+
+def _update_target() -> tuple[Path, str] | None:
+    """(path to replace, kind) for the running build, or None if not packaged.
+
+    ``kind`` is ``"exe"`` (Windows - needs the helper swap) or ``"file"``
+    (Linux binary / AppImage - can be replaced in place).
+    """
+    if os.name == "nt":
+        return (Path(sys.executable), "exe") if _is_frozen() else None
+    appimage = os.environ.get("APPIMAGE")
+    if appimage and Path(appimage).is_file():
+        return (Path(appimage), "file")
+    return (Path(sys.executable), "file") if _is_frozen() else None
+
+
+def _latest_release(timeout: float = 5.0) -> dict | None:
+    req = urllib.request.Request(GITHUB_RELEASES_API, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{PRODUCT}/{APP_VERSION}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def check_for_update() -> dict | None:
+    """Return release info if GitHub publishes a newer tag, else None."""
+    rel = _latest_release()
+    if not rel:
+        return None
+    tag = str(rel.get("tag_name") or "").strip()
+    if not tag or _version_tuple(tag) <= _version_tuple(APP_VERSION):
+        return None
+    asset = _update_asset_name()
+    url, digest, size = GITHUB_RELEASES_PAGE, None, 0
+    for a in rel.get("assets") or []:
+        if str(a.get("name") or "").lower() == asset.lower():
+            url = a.get("browser_download_url") or url
+            digest = a.get("digest")            # "sha256:<hex>" on newer GitHub API
+            size = int(a.get("size") or 0)
+            break
+    return {"tag": tag, "version": tag.lstrip("vV"), "url": url,
+            "digest": digest, "size": size}
+
+
+def _download_update(url: str, dest: Path, digest: str | None) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
+        for chunk in iter(lambda: r.read(1024 * 1024), b""):
+            h.update(chunk)
+            f.write(chunk)
+    if digest:
+        want = digest.split(":")[-1].lower()
+        if want and h.hexdigest().lower() != want:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise RuntimeError("downloaded update failed the sha256 check")
+
+
+def _spawn_windows_swap(new_exe: Path, current_exe: Path) -> None:
+    """Write a .cmd that waits for this process to exit, swaps the exe, relaunches.
+
+    A running .exe can't be overwritten on Windows, so retry ``move`` until the
+    file unlocks, then start the new build. ``ping`` is the delay because
+    ``timeout`` needs a console, which a detached process doesn't have.
+    """
+    cmd = Path(tempfile.gettempdir()) / "rpmap-update.cmd"
+    lines = [
+        "@echo off",
+        "setlocal",
+        "set N=0",
+        ":retry",
+        f'move /y "{new_exe}" "{current_exe}" >nul 2>&1',
+        "if not errorlevel 1 goto replaced",
+        "set /a N+=1",
+        "if %N% geq 120 exit /b 1",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto retry",
+        ":replaced",
+        f'start "" "{current_exe}"',
+        'del "%~f0"',
+        "",
+    ]
+    cmd.write_text("\r\n".join(lines))
+    detached = 0x00000008          # DETACHED_PROCESS
+    new_group = 0x00000200         # CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(["cmd", "/c", str(cmd)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True,
+                     creationflags=detached | new_group)
+
+
+def apply_update(info: dict) -> None:
+    """Download and install a newer build, then restart. Only for packaged builds."""
+    url = info.get("url")
+    target = _update_target()
+    if not url or not target:
+        return
+    path, kind = target
+    staged = path.with_name(path.name + ".new")
+    try:
+        _download_update(url, staged, info.get("digest"))
+    except Exception as e:
+        print(f"rpmap: update download failed: {e}", file=sys.stderr)
+        return
+    if kind == "exe":
+        _spawn_windows_swap(staged, path)
+        print(f"rpmap: updating to {info.get('version')} - restarting...", flush=True)
+        os._exit(0)
+    try:                       # POSIX can replace the running file in place
+        os.chmod(staged, 0o755)
+        os.replace(staged, path)
+    except OSError as e:
+        print(f"rpmap: update swap failed: {e}; get it from {GITHUB_RELEASES_PAGE}",
+              file=sys.stderr)
+        return
+    print(f"rpmap: updated to {info.get('version')} - restarting...", flush=True)
+    os.execv(str(path), [str(path), *sys.argv[1:]])
+
+
+def maybe_self_update(auto: bool) -> None:
+    """Check GitHub for a newer release. If ``auto``, install it when packaged."""
+    info = check_for_update()
+    if not info:
+        return
+    if auto and _update_target():
+        apply_update(info)
+        return
+    print(f"rpmap: newer version available: {info['tag']}  ->  {info['url']}",
+          file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -1386,6 +1547,8 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cooked", help="path to TAGame/CookedPCConsole")
     ap.add_argument("--slot", default=DEFAULT_SLOT, choices=sorted(SLOTS))
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="skip the startup check for a newer GitHub release")
     sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("list", help="list candidate maps")
@@ -1415,6 +1578,8 @@ def main(argv: list[str] | None = None) -> int:
     p_jn.add_argument("code")
     p_nm = sub.add_parser("name", help="set the display name peers see")
     p_nm.add_argument("value")
+    sub.add_parser("version", help="print the version")
+    sub.add_parser("check-update", help="check GitHub for a newer release")
 
     args = ap.parse_args(argv)
 
@@ -1441,6 +1606,21 @@ def main(argv: list[str] | None = None) -> int:
         save_config(cfg)
         print("display name:", cfg.get("display_name") or "(unset)")
         return 0
+
+    if args.cmd == "version":
+        print(f"{PRODUCT} {APP_VERSION}")
+        return 0
+
+    if args.cmd == "check-update":
+        info = check_for_update()
+        if info:
+            print(f"{PRODUCT} {APP_VERSION}: {info['tag']} available  ->  {info['url']}")
+        else:
+            print(f"{PRODUCT} {APP_VERSION}: up to date (no newer release found)")
+        return 0
+
+    if args.cmd in (None, "serve") and not args.no_update_check:
+        maybe_self_update(auto=True)
 
     cooked = detect_cooked(args.cooked)
     if cooked is None:

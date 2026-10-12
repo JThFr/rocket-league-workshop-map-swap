@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match APP_VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(grep -oP 'APP_VERSION\s*=\s*"\K[^"]+' scripts/rpmap.py)
+          echo "tag=$tag  APP_VERSION=$ver"
+          test "$tag" = "$ver" || { echo "::error::tag '$tag' != APP_VERSION '$ver'"; exit 1; }
+
+  build:
+    needs: verify-version
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

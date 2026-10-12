@@ -1,0 +1,71 @@
+name: build
+
+# Reusable: called by ci.yml (on PRs) and release.yml (on tags).
+on:
+  workflow_call:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+      - name: Build exe
+        run: pyinstaller --onefile --console --name rpmap scripts/rpmap.py
+      - name: Smoke-test the exe
+        run: |
+          .\dist\rpmap.exe version
+          .\dist\rpmap.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpmap-windows
+          path: dist/rpmap.exe
+
+  build-linux-appimage:
+    runs-on: ubuntu-22.04          # older base = wider glibc compatibility
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build one-file binary
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          pyinstaller --onefile --console --name rpmap scripts/rpmap.py
+      - name: Assemble AppDir
+        run: |
+          set -euo pipefail
+          APPDIR="$PWD/rpmap.AppDir"
+          rm -rf "$APPDIR"
+          install -Dm755 dist/rpmap "$APPDIR/usr/bin/rpmap"
+          install -Dm644 assets/rpmap.desktop "$APPDIR/rpmap.desktop"
+          install -Dm644 assets/rpmap.png "$APPDIR/rpmap.png"
+          cp assets/rpmap.png "$APPDIR/.DirIcon"
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/rpmap" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+      - name: Build AppImage
+        run: |
+          set -euo pipefail
+          curl -fL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run rpmap.AppDir rpmap-x86_64.AppImage
+      - name: Smoke-test binary and AppImage
+        run: |
+          ./dist/rpmap version
+          ./rpmap-x86_64.AppImage --appimage-extract-and-run version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpmap-linux
+          path: rpmap-x86_64.AppImage

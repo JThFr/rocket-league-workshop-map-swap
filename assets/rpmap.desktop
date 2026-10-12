@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=rpmap
+Comment=Rocket League workshop map swapper
+Exec=rpmap
+Icon=rpmap
+Terminal=true
+Categories=Game;Utility;
