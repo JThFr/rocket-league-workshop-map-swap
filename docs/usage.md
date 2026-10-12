@@ -97,6 +97,10 @@ doesn't have the map reports *not installed* with a Workshop link. Syncs are **e
 reference-only — anything obtained outside the Steam Workshop syncs only if the peer already
 has the byte-identical file. Never swap during an online match.
 
+The map grid has an **Only maps everyone has** toggle that hides maps a reachable peer would
+have to download. "Everyone" includes **you**, so with no peers running rpmap it simply shows
+all your maps (the toggle is still usable).
+
 Design notes: [`rpmap-phase2.md`](rpmap-phase2.md).
 
 ## Configuration
