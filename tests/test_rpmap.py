@@ -8,10 +8,10 @@ Runs with the standard library only:
 from __future__ import annotations
 
 import http.client
-import importlib.util
 import json
 import os
 import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -19,13 +19,14 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "rpmap.py"
+sys.path.insert(0, str(ROOT / "scripts"))
 
-_spec = importlib.util.spec_from_file_location("rpmap", SCRIPT)
-rpmap = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(rpmap)
+import rpmap_config as config
+import rpmap_maps as maps
+import rpmap_update as update
+import rpmap_web as web
 
-SLOT_FILE = rpmap.SLOTS["underpass"][0]
+SLOT_FILE = config.SLOTS["underpass"][0]
 PACKAGE_TAG = 0x9E2A83C1
 
 
@@ -59,18 +60,18 @@ class _CookedFixture(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_ordering(self):
-        self.assertGreater(rpmap._version_tuple("v0.10.0"), rpmap._version_tuple("0.9.9"))
-        self.assertEqual(rpmap._version_tuple("0.3.0"), (0, 3, 0))
+        self.assertGreater(update._version_tuple("v0.10.0"), update._version_tuple("0.9.9"))
+        self.assertEqual(update._version_tuple("0.3.0"), (0, 3, 0))
 
     def test_app_version_shape(self):
-        self.assertRegex(rpmap.APP_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(config.APP_VERSION, r"^\d+\.\d+\.\d+$")
 
     def test_asset_name_is_known(self):
-        self.assertIn(rpmap._update_asset_name(),
+        self.assertIn(update._update_asset_name(),
                       {"rpmap.exe", "rpmap-x86_64.AppImage"})
 
     def test_secret_format(self):
-        self.assertRegex(rpmap.new_secret(), r"^[0-9a-f]{4}(-[0-9a-f]{4}){3}$")
+        self.assertRegex(config.new_secret(), r"^[0-9a-f]{4}(-[0-9a-f]{4}){3}$")
 
 
 class UpdateTests(unittest.TestCase):
@@ -86,10 +87,10 @@ class UpdateTests(unittest.TestCase):
     def test_appimage_env_selects_deferred_swap(self):
         with tempfile.NamedTemporaryFile(suffix=".AppImage") as f:
             os.environ["APPIMAGE"] = f.name
-            self.assertEqual(rpmap._update_target(), (Path(f.name), "appimage"))
+            self.assertEqual(update._update_target(), (Path(f.name), "appimage"))
 
     def test_no_target_when_running_from_source(self):
-        self.assertIsNone(rpmap._update_target())
+        self.assertIsNone(update._update_target())
 
 
 class CaBundleTests(unittest.TestCase):
@@ -97,10 +98,10 @@ class CaBundleTests(unittest.TestCase):
 
     def setUp(self):
         self._saved = os.environ.pop("SSL_CERT_FILE", None)
-        self._orig = rpmap.CA_BUNDLE_CANDIDATES
+        self._orig = config.CA_BUNDLE_CANDIDATES
 
     def tearDown(self):
-        rpmap.CA_BUNDLE_CANDIDATES = self._orig
+        config.CA_BUNDLE_CANDIDATES = self._orig
         if self._saved is None:
             os.environ.pop("SSL_CERT_FILE", None)
         else:
@@ -111,44 +112,44 @@ class CaBundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             good = Path(d) / "ca.pem"
             good.write_text("x")
-            rpmap.CA_BUNDLE_CANDIDATES = (str(Path(d) / "missing.pem"), str(good))
-            self.assertEqual(rpmap.ensure_ca_bundle(), str(good))
+            config.CA_BUNDLE_CANDIDATES = (str(Path(d) / "missing.pem"), str(good))
+            self.assertEqual(config.ensure_ca_bundle(), str(good))
             self.assertEqual(os.environ.get("SSL_CERT_FILE"), str(good))
 
     @unittest.skipIf(os.name == "nt", "POSIX CA-bundle fallback")
     def test_respects_an_existing_setting(self):
         os.environ["SSL_CERT_FILE"] = "/custom/ca.pem"
-        rpmap.CA_BUNDLE_CANDIDATES = ("/etc/ssl/certs/ca-certificates.crt",)
-        self.assertIsNone(rpmap.ensure_ca_bundle())
+        config.CA_BUNDLE_CANDIDATES = ("/etc/ssl/certs/ca-certificates.crt",)
+        self.assertIsNone(config.ensure_ca_bundle())
         self.assertEqual(os.environ["SSL_CERT_FILE"], "/custom/ca.pem")
 
 
 class SlotTests(_CookedFixture):
     def test_slot_reports_stock_when_backup_matches(self):
         (self.cooked / (SLOT_FILE + ".orig")).write_bytes(b"STOCK")
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "stock")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "stock")
 
     def test_use_then_restore_roundtrip(self):
-        rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
-        state = rpmap.slot_state(self.cooked, "underpass")
+        maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+        state = maps.slot_state(self.cooked, "underpass")
         self.assertEqual(state["state"], "custom")
         self.assertEqual(state["map_name"], "TestMap")
         self.assertTrue(state["backup_exists"])
 
-        rpmap.restore_slot(self.cooked, "underpass")
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "stock")
+        maps.restore_slot(self.cooked, "underpass")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "stock")
 
     def test_use_refuses_custom_slot_without_backup(self):
         (self.cooked / SLOT_FILE).write_bytes(b"TESTMAP")   # matches mods/TestMap.upk
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "custom")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "custom")
         with self.assertRaises(RuntimeError):
-            rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+            maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
 
     def test_stock_slot_without_backup_is_recognised(self):
         # The default slot (Utopia) usually has no backup yet; the game file's
         # package header must still identify it as stock, not "unknown".
         (self.cooked / SLOT_FILE).write_bytes(_package(34))
-        st = rpmap.slot_state(self.cooked, "underpass")
+        st = maps.slot_state(self.cooked, "underpass")
         self.assertEqual(st["state"], "stock")
         self.assertFalse(st["backup_exists"])
         self.assertTrue(st["inferred"])
@@ -156,47 +157,47 @@ class SlotTests(_CookedFixture):
     def test_swapped_slot_without_backup_is_custom(self):
         # A licensee-0 cook is a community map, even when it isn't in the list.
         (self.cooked / SLOT_FILE).write_bytes(_package(0))
-        st = rpmap.slot_state(self.cooked, "underpass")
+        st = maps.slot_state(self.cooked, "underpass")
         self.assertEqual(st["state"], "custom")
         self.assertIsNone(st["map_name"])
         with self.assertRaises(RuntimeError):   # must not back up a custom map as stock
-            rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+            maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
 
     def test_garbage_slot_file_stays_unknown(self):
         (self.cooked / SLOT_FILE).write_bytes(b"not a UE3 package")
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "unknown")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "unknown")
 
     def test_file_hash_matches_for_identical_bytes(self):
         a = self.cooked / "mods" / "TestMap.upk"
         b = self.cooked / "mods" / "Copy.upk"
         b.write_bytes(a.read_bytes())
-        self.assertEqual(rpmap.file_hash(a), rpmap.file_hash(b))
+        self.assertEqual(maps.file_hash(a), maps.file_hash(b))
 
     def test_slot_state_reports_arena_name(self):
-        st = rpmap.slot_state(self.cooked, "underpass")
+        st = maps.slot_state(self.cooked, "underpass")
         self.assertEqual(st["arena"], "Underpass")
         self.assertEqual(st["note"], 'NOT "Tokyo Underpass"')
-        self.assertEqual(rpmap.slot_state(self.cooked, "utopia")["arena"], "Utopia Retro")
+        self.assertEqual(maps.slot_state(self.cooked, "utopia")["arena"], "Utopia Retro")
 
 
 class RestoreOnExitTests(_CookedFixture):
     def test_restores_a_swapped_slot(self):
-        rpmap.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "custom")
-        rpmap._restore_on_exit(self.cooked, "underpass")
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "stock")
+        maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "TestMap.upk")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "custom")
+        web._restore_on_exit(self.cooked, "underpass")
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "stock")
 
     def test_is_a_noop_without_a_backup(self):
-        rpmap._restore_on_exit(self.cooked, "underpass")   # must not raise
-        self.assertEqual(rpmap.slot_state(self.cooked, "underpass")["state"], "unknown")
+        web._restore_on_exit(self.cooked, "underpass")   # must not raise
+        self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "unknown")
 
 
 class MapsTests(_CookedFixture):
     def test_list_maps_finds_mods(self):
-        self.assertIn("TestMap", {m["name"] for m in rpmap.list_maps(self.cooked)})
+        self.assertIn("TestMap", {m["name"] for m in maps.list_maps(self.cooked)})
 
     def test_resolve_map_by_name_is_case_insensitive(self):
-        m = rpmap.resolve_map(self.cooked, "testmap")
+        m = maps.resolve_map(self.cooked, "testmap")
         self.assertIsNotNone(m)
         self.assertEqual(m["name"], "TestMap")
 
@@ -214,7 +215,7 @@ class HttpTests(_CookedFixture):
             "ident": {"peer_id": "tester", "name": "tester", "ips": [], "dns": ""},
             "dev": False, "port": 0,
         }
-        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), rpmap.make_handler(engine))
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(engine))
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
