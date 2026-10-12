@@ -36,6 +36,7 @@ from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>rpmap - custom map loader</title>
 <style>
   :root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--fg:#c9d1d9;--fg2:#8b949e;
@@ -186,7 +187,7 @@ function toastLink(msg, url, ms=6000){
   t.appendChild(document.createTextNode(msg + (url ? '  ' : '')));
   if(url){
     const a = document.createElement('a');
-    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
     a.textContent = 'Open Workshop \u2197';
     a.style.color = '#79c0ff'; a.style.textDecoration = 'underline';
     t.appendChild(a);
@@ -261,7 +262,7 @@ function render(){
       <div class="body">
         <div class="name" title="${esc(m.name)}">${esc(m.name)}</div>
         <div class="meta"><span class="src">${esc(m.source)}</span><span class="muted">${fmtSize(m.size)}</span></div>
-        <button class="primary" onclick="useMap('${m.id}')" ${active?'disabled':''}>${active?'Loaded':'Load into slot'}</button>
+        <button class="primary useBtn" data-map-id="${esc(m.id)}" ${active?'disabled':''}>${active?'Loaded':'Load into slot'}</button>
       </div></div>`;
   }).join('') || '<div class="muted">No maps found. Put .udk/.upk files in ~/maps, or subscribe on Steam Workshop.</div>';
 }
@@ -345,8 +346,8 @@ function peerRow(p, isSelf){
   let actions = isSelf ? '' : syncBadge(p.in_sync);
   if(!isSelf && p.rpmap){
     const id = esc(p.peer_id||'');
-    actions += ` <button onclick="syncFrom('${id}')" title="Load their map here">Switch me</button>`
-             + ` <button onclick="syncTo('${id}')" title="Load your map there">Set theirs</button>`;
+    actions += ` <button class="syncFromBtn" data-peer-id="${id}" title="Load their map here">Switch me</button>`
+             + ` <button class="syncToBtn" data-peer-id="${id}" title="Load your map there">Set theirs</button>`;
   }
   return `<tr>
     <td>${dot}${esc(p.name||'?')}${isSelf?' <span class="muted">(you)</span>':''}</td>
@@ -427,6 +428,18 @@ function syncFrom(id){ const p=findPeer(id); if(p) doSync('pull', [peerTarget(p)
 function syncTo(id){ const p=findPeer(id); if(p) doSync('push', [peerTarget(p)]); }
 function syncAll(){ doSync('push', (PEERS||[]).filter(p=>p.rpmap).map(peerTarget)); }
 
+// One delegated listener instead of inline handlers: ids travel as element
+// data (HTML-escaped attributes) and are never interpolated into generated
+// JS source - inline "onclick=\"fn('${id}')\"" patterns are an injection trap
+// because HTML entities decode before the JS engine sees the string.
+document.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  if(btn.classList.contains('useBtn')) useMap(btn.dataset.mapId);
+  else if(btn.classList.contains('syncFromBtn')) syncFrom(btn.dataset.peerId);
+  else if(btn.classList.contains('syncToBtn')) syncTo(btn.dataset.peerId);
+});
+
 load_state(); loadSession(); loadPeers();
 TIMERS.push(setInterval(load_state, 4000));
 TIMERS.push(setInterval(loadPeers, 8000));
@@ -449,6 +462,10 @@ def make_handler(engine: dict):
         allowed_hosts.add(_ip)
     if ident.get("dns"):
         allowed_hosts.add(ident["dns"])
+    # Addresses that count as "this machine" for the local-only gates: the
+    # bound host plus our own tailnet IPs. A UI served on the tailnet address
+    # is reached by the local browser *from* that address, not from 127.0.0.1.
+    own_ips = {host} | {str(_ip) for _ip in (ident.get("ips") or [])}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "rpmap"
@@ -460,6 +477,18 @@ def make_handler(engine: dict):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            # The UI token lives in the URL query, and previews are served
+            # with a sniffed content type - so never let a browser guess the
+            # type, and never let a link click leak the URL elsewhere. The CSP
+            # is deliberately scoped: the page uses inline script/style, so
+            # instead of pretending `script-src 'unsafe-inline'` helps, it
+            # blocks the things that matter here - framing, <base> hijack and
+            # form hijack.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy",
+                             "frame-ancestors 'none'; base-uri 'none'; "
+                             "form-action 'none'")
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -470,7 +499,8 @@ def make_handler(engine: dict):
             self._send(json.dumps(obj).encode(), "application/json", code)
 
         def _authed(self, q) -> bool:
-            if q.get("token", [""])[0] == token:
+            if hmac.compare_digest(str(q.get("token", [""])[0]).encode(),
+                                   token.encode()):
                 return True
             secret = engine.get("secret") or ""
             auth = self.headers.get("Authorization") or ""
@@ -493,15 +523,19 @@ def make_handler(engine: dict):
             return (self.headers.get("Host") or "").split(":")[0] in allowed_hosts
 
         def _local_ok(self) -> bool:
-            """True only for a loopback client - used to gate quitting.
+            """True only for a client on this machine - used to gate quitting
+            and rotating the session code.
 
-            A tailnet peer can reach the API, but must never be able to stop
-            this machine's server.
+            Loopback, plus this machine's own addresses (a UI served on the
+            tailnet IP is reached by the local browser from that address). A
+            remote peer can reach the API, but must never be able to stop this
+            machine's server or replace its session code.
             """
             try:
-                return ipaddress.ip_address(self.client_address[0]).is_loopback
+                addr = ipaddress.ip_address(self.client_address[0])
             except ValueError:
                 return False
+            return addr.is_loopback or str(addr) in own_ips
 
         def do_GET(self):
             if not self._source_ok():
@@ -590,6 +624,8 @@ def make_handler(engine: dict):
                         threading.Thread(target=quit_fn, daemon=True).start()
                     return
                 if u.path == "/api/session":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
                     new = str(payload.get("secret") or "").strip() or new_secret()
                     engine["secret"] = new
                     engine.setdefault("cfg", {})["session_secret"] = new
