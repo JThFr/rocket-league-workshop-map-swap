@@ -164,3 +164,16 @@ Both sides use the shared **session code** (the relay token defaults to it). On 
 the game's **Join LAN / local lobby** list — the host's lobby appears and connects straight to the
 host's `100.x:7777`. The relay carries **only discovery**; the match itself runs over Tailscale.
 Validated in-game between a Linux host and a Windows peer.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+### Not affiliated with Psyonix or Epic Games
+
+`rpmap` is an unofficial, non-commercial community tool. It is **not affiliated with, endorsed
+by, or sponsored by** Psyonix LLC or Epic Games. "Rocket League" and the Rocket League logo are
+trademarks of Psyonix LLC, used here only to describe what the tool is for.
+
+The app icon (`assets/rpmap.png`) is **original artwork** — a generic hex-panelled sphere, not a
+Rocket League asset. It can be regenerated with `scripts/make_icon.py`.
