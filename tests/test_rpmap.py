@@ -864,6 +864,8 @@ class HttpTests(_CookedFixture):
         data = json.loads(body)
         self.assertEqual(data["current"], config.APP_VERSION)
         self.assertIsNone(data["auto_update"])
+        self.assertEqual(data["mode"], "off")               # effective default
+        self.assertEqual(data["modes"], list(config.AUTO_UPDATE_MODES))
         self.assertFalse(data["configured"])
         self.assertFalse(data["can_self_update"])
         self.assertFalse(data["needs_onboarding"])          # only packaged builds ask
@@ -883,6 +885,13 @@ class HttpTests(_CookedFixture):
         self.assertTrue(json.loads(body)["checked"])
         self.assertEqual(len(calls), 1)
 
+    def test_update_check_mode_checks_on_load(self):
+        """'check on startup' means the status check runs without ?refresh."""
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        self.engine["cfg"]["auto_update"] = "check"
+        _, body = self._req("GET", "/api/update?token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["checked"])
+
     def test_update_needs_onboarding_on_a_packaged_build(self):
         self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
         _, body = self._req("GET", "/api/update?token=" + self.TOKEN)
@@ -890,13 +899,20 @@ class HttpTests(_CookedFixture):
         self.assertTrue(data["can_self_update"])
         self.assertTrue(data["needs_onboarding"])
 
-    def test_update_auto_set_is_local_and_persists(self):
+    def test_update_mode_is_local_and_persists(self):
         self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
-        status, body = self._req("POST", "/api/update/auto?token=" + self.TOKEN,
-                                 body={"enabled": True})
+        status, body = self._req("POST", "/api/update/mode?token=" + self.TOKEN,
+                                 body={"mode": "check"})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["ok"])
-        self.assertIs(config.auto_update_setting(config.load_config()), True)
+        self.assertEqual(config.auto_update_setting(config.load_config()), "check")
+        self.assertEqual(json.loads(body)["update"]["mode"], "check")
+
+    def test_update_mode_rejects_a_bad_value(self):
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        _, body = self._req("POST", "/api/update/mode?token=" + self.TOKEN,
+                            body={"mode": "sometimes"})
+        self.assertFalse(json.loads(body)["ok"])
 
     def test_update_apply_refused_when_not_packaged(self):
         self._patch_update(info={"tag": "v9.9.9", "version": "9.9.9", "url": "u"},
@@ -1229,7 +1245,7 @@ class NetworkModeTests(unittest.TestCase):
 
 
 class AutoUpdateConfigTests(unittest.TestCase):
-    """`auto_update` unset (ask) vs. explicitly true/false (never ask again)."""
+    """Update preference: unset (ask) vs. off / check (notify) / auto (install)."""
 
     def test_unset_is_none(self):
         self.assertIsNone(config.auto_update_setting({}))
@@ -1237,13 +1253,22 @@ class AutoUpdateConfigTests(unittest.TestCase):
         self.assertIsNone(config.auto_update_setting({"auto_update": "yes"}))
         self.assertIsNone(config.auto_update_setting({"auto_update": 1}))
 
-    def test_bool_values_round_trip(self):
-        self.assertTrue(config.auto_update_setting({"auto_update": True}))
-        self.assertFalse(config.auto_update_setting({"auto_update": False}))
+    def test_modes_round_trip(self):
+        for mode in config.AUTO_UPDATE_MODES:
+            self.assertEqual(config.auto_update_setting({"auto_update": mode}), mode)
+
+    def test_legacy_booleans_still_read(self):
+        self.assertEqual(config.auto_update_setting({"auto_update": True}), "auto")
+        self.assertEqual(config.auto_update_setting({"auto_update": False}), "off")
+
+    def test_effective_mode_defaults_to_off(self):
+        self.assertEqual(config.auto_update({}), "off")
+        self.assertEqual(config.auto_update({"auto_update": "nonsense"}), "off")
+        self.assertEqual(config.auto_update({"auto_update": "check"}), "check")
 
 
 class StartupUpdateGateTests(unittest.TestCase):
-    """Auto-update runs on startup only after the user opts in."""
+    """Startup checking/installing happens only for the chosen mode."""
 
     def setUp(self):
         self._saved = (rpmap.running_instance, rpmap.maybe_self_update,
@@ -1265,12 +1290,17 @@ class StartupUpdateGateTests(unittest.TestCase):
         self._run({})
         self.assertEqual(self.calls, [])
 
-    def test_disabled_never_checks(self):
-        self._run({"auto_update": False})
+    def test_off_never_checks(self):
+        self._run({"auto_update": "off"})
+        self._run({"auto_update": False})                  # legacy off
         self.assertEqual(self.calls, [])
 
-    def test_enabled_checks_and_installs(self):
-        self._run({"auto_update": True})
+    def test_check_mode_checks_without_installing(self):
+        self._run({"auto_update": "check"})
+        self.assertEqual(self.calls, [False])
+
+    def test_auto_mode_checks_and_installs(self):
+        self._run({"auto_update": "auto"})
         self.assertEqual(self.calls, [True])
 
 
@@ -1352,7 +1382,7 @@ class DoctorTests(unittest.TestCase):
                 (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
                  doctor.update.check_for_update) = saved
 
-    def test_reports_the_auto_update_setting(self):
+    def test_reports_the_update_preference(self):
         import contextlib
         import io
         with tempfile.TemporaryDirectory(prefix="rpmap-doctor-") as d:
@@ -1365,13 +1395,16 @@ class DoctorTests(unittest.TestCase):
             doctor.peers.tailscale_self = lambda: {"ips": []}
             doctor.update.check_for_update = lambda: None
             cfg = config.load_config()
-            cfg["auto_update"] = True
-            config.save_config(cfg)
             try:
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    doctor.run(str(cooked), "underpass")
-                self.assertIn("auto-update: enabled", buf.getvalue())
+                for mode, expected in (("check", "check on startup"),
+                                       ("auto", "install automatically"),
+                                       ("off", "manual only")):
+                    cfg["auto_update"] = mode
+                    config.save_config(cfg)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        doctor.run(str(cooked), "underpass")
+                    self.assertIn(expected, buf.getvalue())
             finally:
                 (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
                  doctor.update.check_for_update) = saved

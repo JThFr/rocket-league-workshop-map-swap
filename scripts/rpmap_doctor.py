@@ -119,14 +119,16 @@ def run(cooked_arg: str | None, slot: str) -> int:
         checks.append(("warn", "session code not set",
                        "run `rpmap session --new` (or paste a peer's code)"))
 
-    # --- auto-update consent --------------------------------------------- #
+    # --- update preference ------------------------------------------------- #
     setting = auto_update_setting(cfg)
-    if setting is True:
-        checks.append(("ok", "auto-update: enabled"))
-    elif setting is False:
-        checks.append(("info", "auto-update: disabled"))
+    if setting == "auto":
+        checks.append(("ok", "updates: install automatically on startup"))
+    elif setting == "check":
+        checks.append(("ok", "updates: check on startup (no auto-install)"))
+    elif setting == "off":
+        checks.append(("info", "updates: manual only"))
     else:
-        checks.append(("info", "auto-update: not set",
+        checks.append(("info", "updates: not chosen yet",
                        "asked on first launch (packaged builds) / in the UI"))
 
     # --- self-update TLS -------------------------------------------------- #

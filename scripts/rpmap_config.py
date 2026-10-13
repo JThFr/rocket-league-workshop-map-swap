@@ -50,6 +50,14 @@ MODE_LAN = "lan"
 NETWORK_MODES = (MODE_TAILSCALE, MODE_LAN)
 DEFAULT_NETWORK_MODE = MODE_TAILSCALE
 
+# Update preference: "off" never checks; "check" looks for a newer release on
+# startup and surfaces it without installing; "auto" also installs it.
+UPDATE_OFF = "off"
+UPDATE_CHECK = "check"
+UPDATE_AUTO = "auto"
+AUTO_UPDATE_MODES = (UPDATE_OFF, UPDATE_CHECK, UPDATE_AUTO)
+DEFAULT_AUTO_UPDATE = UPDATE_OFF
+
 # Where the packaged builds live (used only by the self-updater).
 GITHUB_REPO = "JThFr/rocket-league-workshop-map-swap"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -125,14 +133,28 @@ def network_mode(cfg: dict | None = None) -> str:
     return network_mode_setting(cfg) or DEFAULT_NETWORK_MODE
 
 
-def auto_update_setting(cfg: dict | None = None) -> bool | None:
-    """The stored auto-update choice: True, False, or None if never asked.
+def auto_update_setting(cfg: dict | None = None) -> str | None:
+    """The stored update preference: ``"off"``, ``"check"``, ``"auto"``, or None.
 
-    ``None`` is what drives the first-run consent popup: the app must not
-    install (or even check for) updates until the user has answered.
+    ``None`` means *never asked* and drives the first-run consent popup: the
+    app must not check for (let alone install) updates until the user answers.
+    Legacy ``true``/``false`` values are still understood (``true`` → ``auto``).
     """
     value = (cfg or {}).get("auto_update") if isinstance(cfg, dict) else None
-    return value if isinstance(value, bool) else None
+    if isinstance(value, bool):
+        return UPDATE_AUTO if value else UPDATE_OFF
+    value = str(value or "").strip().lower()
+    return value if value in AUTO_UPDATE_MODES else None
+
+
+def auto_update(cfg: dict | None = None) -> str:
+    """The effective update preference, always a valid value.
+
+    An unset or unknown preference falls back to ``"off"`` so we never contact
+    GitHub unasked; use :func:`auto_update_setting` to tell "chosen off" apart
+    from "never asked" (the onboarding prompt).
+    """
+    return auto_update_setting(cfg) or DEFAULT_AUTO_UPDATE
 
 
 def new_secret() -> str:

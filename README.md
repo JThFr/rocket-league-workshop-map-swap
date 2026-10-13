@@ -102,15 +102,16 @@ is identical either way. The server listens on all interfaces and **gates every 
 Tailscale mode accepts only your tailnet (plus loopback), local-network mode accepts only
 private/LAN addresses. Each call still needs the shared session code or the UI token.
 
-## Updates — opt-in, with a trust caveat
+## Updates — opt-in
 
-A packaged build can update itself, but only if you say so. On first launch it asks whether
-to **allow automatic updates**, spelling out that enabling them means **trusting the owner
-of the repository** to publish whatever they want (downloads are `sha256`-verified and only
-accepted from this project's official GitHub releases). Until you answer, rpmap doesn't
-contact GitHub; if you decline, it never checks on startup. The web UI's **Updates** panel
-shows your version, the auto-update state, a **Check for updates** button, and a link to the
-GitHub release. See [docs/usage.md](docs/usage.md#updates) for the details.
+A packaged build can update itself, but only if you say so. On first launch it asks how to
+handle updates: **Off** (manual only), **Check on startup** (look for a newer release and tell
+you, but never install it), or **Install automatically** — which means **trusting the owner of
+the repository** to publish whatever they want (downloads are `sha256`-verified and only
+accepted from this project's official GitHub releases). Until you choose, rpmap doesn't contact
+GitHub. The web UI's **Updates** panel shows your version, the chosen mode, a **Check for
+updates** button, and a link to the GitHub release. See
+[docs/usage.md](docs/usage.md#updates) for the details.
 
 ## Usage
 

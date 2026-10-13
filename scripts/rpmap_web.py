@@ -23,9 +23,11 @@ from urllib.parse import urlparse, parse_qs, quote
 import rpmap_lan
 import rpmap_update as update
 import rpmap_window
-from rpmap_config import (APP_VERSION, DEFAULT_PORT, GITHUB_RELEASES_PAGE, MODE_LAN,
-                          MODE_TAILSCALE, NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO,
-                          TAILNET, auto_update_setting, clear_runtime, load_config,
+from rpmap_config import (APP_VERSION, AUTO_UPDATE_MODES, DEFAULT_PORT,
+                          GITHUB_RELEASES_PAGE, MODE_LAN, MODE_TAILSCALE,
+                          NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO, TAILNET,
+                          UPDATE_AUTO, UPDATE_CHECK, auto_update,
+                          auto_update_setting, clear_runtime, load_config,
                           network_mode, network_mode_setting, new_secret, pid_alive,
                           read_runtime, save_config, write_runtime)
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
@@ -119,26 +121,30 @@ UPDATE_CACHE_TTL = 60.0          # seconds to reuse a GitHub release check
 
 
 def _update_status(engine: dict, refresh: bool = False) -> dict:
-    """The auto-update setting plus (cached) release info for the UI.
+    """The update preference plus (cached) release info for the UI.
 
     ``needs_onboarding`` is true only on a *packaged* build - the only place a
     self-update can happen - so source checkouts never get the trust prompt.
     A release check is a network call, so it only happens when the user asks
-    (``refresh``) or has opted into auto-updates; otherwise the last cached
-    result is reported (``checked`` says whether there is one).
+    (``refresh``) or has opted into checking/auto-installing on startup;
+    otherwise the last cached result is reported (``checked`` says whether
+    there is one).
     """
     cfg = engine.get("cfg") or {}
-    setting = auto_update_setting(cfg)
+    setting = auto_update_setting(cfg)          # "off"/"check"/"auto" or None
+    mode = auto_update(cfg)                     # effective (defaults to "off")
     can_self_update = update._update_target() is not None
 
     cache = engine.get("update_cache")
     fresh = bool(cache) and (time.time() - cache.get("at", 0)) < UPDATE_CACHE_TTL
-    if refresh or (setting is True and not fresh):
+    if refresh or (mode in (UPDATE_CHECK, UPDATE_AUTO) and not fresh):
         cache = engine["update_cache"] = {"at": time.time(),
                                           "info": update.check_for_update()}
     return {
         "current": APP_VERSION,
-        "auto_update": setting,
+        "auto_update": setting,                 # what was chosen (None = unset)
+        "mode": mode,                           # effective: off / check / auto
+        "modes": list(AUTO_UPDATE_MODES),
         "configured": setting is not None,
         "can_self_update": can_self_update,
         "releases_url": GITHUB_RELEASES_PAGE,
@@ -149,9 +155,11 @@ def _update_status(engine: dict, refresh: bool = False) -> dict:
 
 
 def _update_set(engine: dict, payload: dict) -> dict:
-    enabled = bool(payload.get("enabled"))
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in AUTO_UPDATE_MODES:
+        return {"ok": False, "error": "mode must be 'off', 'check' or 'auto'"}
     cfg = engine.setdefault("cfg", {})
-    cfg["auto_update"] = enabled
+    cfg["auto_update"] = mode
     save_config(cfg)
     return {"ok": True, "update": _update_status(engine)}
 
@@ -408,10 +416,12 @@ PAGE = r"""<!doctype html>
       <button onclick="checkUpdates()">Check for updates</button>
     </div>
     <div class="row" id="autoUpdateRow" style="margin-top:10px">
-      <label class="muted" title="Install new releases automatically on startup">
-        <input type="checkbox" id="autoUpdateBox" onchange="toggleAutoUpdate()">
-        Install updates automatically
-      </label>
+      <label class="muted" title="Don't check or install automatically (use the button above)">
+        <input type="radio" name="updMode" value="off" onchange="setUpdateMode()"> Off</label>
+      <label class="muted" title="Look for a newer release on startup and tell you, but never install it">
+        <input type="radio" name="updMode" value="check" onchange="setUpdateMode()"> Check on startup</label>
+      <label class="muted" title="Check for a newer release on startup and install it automatically">
+        <input type="radio" name="updMode" value="auto" onchange="setUpdateMode()"> Install automatically</label>
       <span class="grow"></span>
       <span class="muted" id="autoUpdateNote"></span>
     </div>
@@ -511,16 +521,18 @@ PAGE = r"""<!doctype html>
   <div class="modal">
     <h2>Allow automatic updates?</h2>
     <p class="muted" style="margin:6px 0 0">
-      rpmap can check GitHub for new releases and install them automatically, replacing the app
-      and restarting. That means <b>trusting the owner of the repository
-      (<code>JThFr</code>)</b> to publish whatever they want. Downloads are
+      rpmap can check GitHub for new releases and, if you want, install them automatically -
+      replacing the app and restarting. Auto-install means <b>trusting the owner of the
+      repository (<code>JThFr</code>)</b> to publish whatever they want. Downloads are
       <b>sha256-verified</b> and only accepted from this project&#39;s official GitHub releases.
-      You can change this any time under <b>Updates</b>.
+      Checking for updates on its own carries no such risk, and you can change this any time
+      under <b>Updates</b>.
     </p>
     <div class="muted" id="updateModalLink" style="margin-top:10px"></div>
     <div class="row" style="justify-content:flex-end;margin-top:14px">
-      <button onclick="saveUpdateAuto(false)">No, I&#39;ll update manually</button>
-      <button class="primary" onclick="saveUpdateAuto(true)">Enable auto-updates</button>
+      <button onclick="saveUpdateMode('off')">No, I&#39;ll check manually</button>
+      <button onclick="saveUpdateMode('check')">Check on startup</button>
+      <button class="primary" onclick="saveUpdateMode('auto')">Install automatically</button>
     </div>
   </div>
 </div>
@@ -936,10 +948,11 @@ function renderUpdate(){
   const row = document.getElementById('autoUpdateRow');
   if(UPDATE.can_self_update){
     row.style.display = '';
-    document.getElementById('autoUpdateBox').checked = UPDATE.auto_update === true;
+    const radio = document.querySelector('input[name="updMode"][value="' + UPDATE.mode + '"]');
+    if(radio) radio.checked = true;
     document.getElementById('autoUpdateNote').textContent =
-      UPDATE.auto_update === true ? 'on \u00b7 installs on startup'
-      : UPDATE.auto_update === false ? 'off' : 'not set';
+      UPDATE.mode === 'auto' ? 'installs on startup'
+      : UPDATE.mode === 'check' ? 'tells you, never installs' : 'manual only';
   } else {
     row.style.display = 'none';
   }
@@ -953,11 +966,14 @@ function renderUpdate(){
     hint.innerHTML = 'Downloads are sha256-verified and only accepted from this project\u2019s '
       + 'official GitHub releases.';
   } else if(!UPDATE.checked){
-    hint.innerHTML = 'Click <b>Check for updates</b> to ask GitHub for the latest release.';
+    hint.innerHTML = 'Click <b>Check for updates</b> to ask GitHub for the latest release, or '
+      + 'pick a startup option below.';
   } else {
-    hint.innerHTML = UPDATE.auto_update === true
+    hint.innerHTML = UPDATE.mode === 'auto'
       ? 'rpmap is up to date. New releases install automatically on startup.'
-      : 'rpmap is up to date.';
+      : UPDATE.mode === 'check'
+        ? 'rpmap is up to date. It will check again on startup and tell you.'
+        : 'rpmap is up to date.';
   }
 }
 async function loadUpdate(){
@@ -972,12 +988,23 @@ async function checkUpdates(){
   renderUpdate();
   toast(UPDATE.info ? ('Update available: ' + UPDATE.info.tag) : 'rpmap is up to date');
 }
-async function toggleAutoUpdate(){
-  const enabled = document.getElementById('autoUpdateBox').checked;
-  const r = await (await api('/api/update/auto', {method:'POST', headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({enabled})})).json();
-  if(r.ok){ UPDATE = r.update; renderUpdate(); toast(enabled ? 'Auto-updates on' : 'Auto-updates off'); }
-  else { toast('Error: ' + (r.error || 'failed')); loadUpdate(); }
+async function setUpdateMode(){
+  const box = document.querySelector('input[name="updMode"]:checked');
+  await saveUpdateMode(box ? box.value : 'off');
+}
+async function saveUpdateMode(mode){
+  document.getElementById('updateModal').style.display = 'none';
+  const r = await (await api('/api/update/mode', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({mode})})).json();
+  if(r.ok){
+    UPDATE = r.update; renderUpdate();
+    toast(mode === 'auto' ? 'Auto-updates on'
+        : mode === 'check' ? 'Will check for updates on startup'
+        : 'Auto-updates off \u2014 check manually');
+  } else {
+    toast('Error: ' + (r.error || 'failed'));
+    loadUpdate();
+  }
 }
 function openUpdateModal(){
   const l = document.getElementById('updateModalLink');
@@ -985,15 +1012,6 @@ function openUpdateModal(){
     + 'rel="noopener noreferrer" style="color:#79c0ff">github.com/'
     + esc(String(UPDATE.releases_url).split('github.com/')[1] || '') + '</a>.';
   document.getElementById('updateModal').style.display = '';
-}
-async function saveUpdateAuto(enabled){
-  document.getElementById('updateModal').style.display = 'none';
-  const r = await (await api('/api/update/auto', {method:'POST', headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({enabled})})).json();
-  if(r.ok){
-    UPDATE = r.update; renderUpdate();
-    toast(enabled ? 'Auto-updates enabled' : 'Auto-updates off \u2014 update manually');
-  } else toast('Error: ' + (r.error || 'failed'));
 }
 async function maybeOnboardUpdate(){
   const u = await loadUpdate();
@@ -1273,7 +1291,7 @@ def make_handler(engine: dict):
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)
                     return self._json(_network_set(engine, payload))
-                if u.path == "/api/update/auto":
+                if u.path == "/api/update/mode":
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)
                     return self._json(_update_set(engine, payload))

@@ -56,8 +56,9 @@ from pathlib import Path
 import rpmap_doctor
 import rpmap_lan
 from rpmap_config import (APP_VERSION, NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO,
-                          DEFAULT_SLOT, auto_update_setting, config_path,
-                          load_config, network_mode, new_secret, save_config)
+                          UPDATE_AUTO, UPDATE_CHECK, DEFAULT_SLOT,
+                          auto_update, config_path, load_config, network_mode,
+                          new_secret, save_config)
 from rpmap_maps import (detect_cooked, fetch_host_map, host_status, install_map,
                         list_maps, resolve_map, restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity
@@ -252,9 +253,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd in (None, "serve") and not args.no_update_check:
         # Opt-in only: never contact GitHub (let alone install) until the user
-        # has explicitly enabled auto-updates in the first-run popup / UI.
-        if auto_update_setting(load_config()) is True:
-            maybe_self_update(auto=True)
+        # has chosen to check on startup or install automatically.
+        mode = auto_update(load_config())
+        if mode in (UPDATE_CHECK, UPDATE_AUTO):
+            maybe_self_update(auto=(mode == UPDATE_AUTO))
 
     cooked = detect_cooked(args.cooked)
     if cooked is None:
