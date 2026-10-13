@@ -53,12 +53,30 @@ Or run it from source — it's one script, standard library only.
 
 ## Requirements
 
-- **Rocket League** installed via **Steam** (auto-detected; see
-  [docs/usage.md](docs/usage.md) to override the game path).
+- **Rocket League** installed via **Steam** (primary, auto-detected) or the **Epic Games
+  Store** (also auto-detected; see [docs/usage.md](docs/usage.md) to override the game path).
 - **Windows 10/11** or a **Linux** desktop. The AppImage needs FUSE; it runs as-is on atomic
   distros like Bazzite.
 - Running from **source** instead? Then you also need **Python 3** (standard library only —
   no `pip install`).
+
+### Steam and Epic Games Store
+
+The tool works with either store — both use the same
+`rocketleague/TAGame/CookedPCConsole` layout, and BakkesMod/Rocket Plugin support both.
+
+- **Steam (primary, what the project is built and tested against):** the install is found via
+  `libraryfolders.vdf`, and **Workshop** subscriptions are picked up automatically (with
+  previews and `steamcommunity.com` links in the UI).
+- **Epic Games Store:** the install is found via Epic's launcher manifests under
+  `%ProgramData%\Epic\...`, so a copy on another drive still works. Epic has **no Steam
+  Workshop**, so the Workshop source simply doesn't apply — put downloaded `.udk`/`.upk` maps
+  in `~/maps` (or the game's `mods/` folder) as usual. Maps without a Workshop id still sync
+  by name+size and are verified by `sha256`.
+
+Writing into `C:\Program Files\Epic Games\...` may need administrator rights, and either
+store's update/"Verify" will restore the stock arena file — the tool's backup + hash detection
+handles that. `RL_COOKED`/`--cooked` overrides detection for any custom location.
 
 ## Network modes — Tailscale or your own LAN
 

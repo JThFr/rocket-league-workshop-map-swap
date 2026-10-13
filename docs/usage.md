@@ -189,7 +189,9 @@ Exit code is non-zero only when a hard check fails (e.g. Rocket League not found
 
 ## Configuration
 
-- `RL_COOKED` — override the `TAGame/CookedPCConsole` path.
+- `RL_COOKED` — override the `TAGame/CookedPCConsole` path (Steam and Epic Games Store
+  installs are detected automatically — Steam via `libraryfolders.vdf`, Epic via its launcher
+  manifests — so use this only for a custom location).
 - `RL_MAPS` — extra folder of `.udk`/`.upk` maps (default `~/maps`).
 - Per-user config lives in `%APPDATA%\rpmap\config.json` (Windows) or
   `~/.config/rpmap/config.json` (Linux); preview cache in the matching local cache dir.
