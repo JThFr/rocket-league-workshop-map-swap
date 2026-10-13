@@ -121,7 +121,9 @@ configuration, updates, and how to build the binaries — is documented in
 
 Starting it also opens a small **status window** ("rpmap is running", with Open UI / Restore
 stock / Quit) so you can always tell it's up and stop it without a terminal — useful after a
-self-update, which runs the app detached. `--no-window` turns it off.
+self-update, which runs the app detached. `--no-window` turns it off. The window and the
+browser tab both show the rpmap icon, and the UI's **Logs** panel surfaces the server output a
+detached run would otherwise hide.
 
 Something not working? **`rpmap doctor`** prints a health report — game path, slot + backup,
 Tailscale, session code, self-update TLS, the status window, and which tailnet peers are actually

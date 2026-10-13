@@ -6,7 +6,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root
 cd "$here"
 
 python3 -m pip install --user --upgrade pyinstaller
-python3 -m PyInstaller --onefile --console --name rpmap --add-data "VERSION:." scripts/rpmap.py --noconfirm
+python3 -m PyInstaller --onefile --console --name rpmap --add-data "VERSION:." --add-data "assets/rpmap.png:assets" scripts/rpmap.py --noconfirm
 
 APPDIR="$here/rpmap.AppDir"
 rm -rf "$APPDIR"

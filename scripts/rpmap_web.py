@@ -21,15 +21,17 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
 import rpmap_lan
+import rpmap_log
 import rpmap_update as update
 import rpmap_window
 from rpmap_config import (APP_VERSION, AUTO_UPDATE_MODES, DEFAULT_PORT,
                           GITHUB_RELEASES_PAGE, MODE_LAN, MODE_TAILSCALE,
                           NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO, TAILNET,
                           UPDATE_AUTO, UPDATE_CHECK, auto_update,
-                          auto_update_setting, clear_runtime, load_config,
-                          network_mode, network_mode_setting, new_secret, pid_alive,
-                          read_runtime, save_config, write_runtime)
+                          auto_update_setting, clear_runtime, icon_data_uri,
+                          load_config, network_mode, network_mode_setting,
+                          new_secret, pid_alive, read_runtime, save_config,
+                          write_runtime)
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
 from rpmap_peers import (gather_peers, known_peers, local_identity, local_ipv4s,
@@ -270,6 +272,7 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>rpmap - custom map loader</title>
+<!--favicon-->
 <style>
   :root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--fg:#c9d1d9;--fg2:#8b949e;
         --accent:#238636;--accent2:#2ea043;--blue:#1f6feb;--warn:#d29922;--red:#da3633;--white:#f0f6fc}
@@ -477,6 +480,20 @@ PAGE = r"""<!doctype html>
       itself runs over Tailscale; prefer a direct path over a DERP relay.
     </div>
   </div>
+
+  <details class="panel" id="logPanel">
+    <summary style="cursor:pointer;color:var(--white)"><b>Logs</b>
+      <span class="muted" style="font-weight:normal"> &mdash; server output (updates, relay, errors)</span></summary>
+    <div class="row" style="margin-top:10px">
+      <span class="muted">Shown for this machine only. Newest at the bottom.</span>
+      <span class="grow"></span>
+      <button onclick="copyLog()">Copy</button>
+      <button onclick="clearLog()">Clear</button>
+    </div>
+    <pre id="logPre" style="margin-top:10px;max-height:320px;overflow:auto;white-space:pre-wrap;
+         background:#0b0f14;border:1px solid #30363d;border-radius:8px;padding:10px;
+         font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)"></pre>
+  </details>
 </main>
 <div class="toast" id="toast"></div>
 
@@ -654,6 +671,7 @@ async function quitApp(){
   if(!confirm('Stop rpmap?\n\nThe server will shut down and this tab can be closed.')) return;
   try{ await api('/api/quit', {method:'POST'}); }catch(e){}
   TIMERS.forEach(clearInterval);
+  stopLogPolling();
   document.body.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
     'color:#c9d1d9;font:15px system-ui,Segoe UI,Roboto,sans-serif;text-align:center">' +
@@ -1036,6 +1054,42 @@ async function applyUpdate(){
   toast('Updating and restarting \u2014 this page will stop responding. Reopen rpmap afterwards.', 9000);
 }
 
+// --- logs (the server's stdout/stderr, shown locally) ----------------------
+let LOG_SEQ = 0;
+let LOG_TIMER = null;
+function appendLog(e){
+  const pre = document.getElementById('logPre');
+  const row = document.createElement('div');
+  const ts = e.t ? new Date(e.t * 1000).toLocaleTimeString() : '';
+  row.textContent = (ts ? ts + '  ' : '') + (e.msg || '');
+  if(e.level === 'error') row.style.color = '#ff7b72';
+  else if(e.level === 'warn') row.style.color = '#e3b341';
+  pre.appendChild(row);
+  while(pre.childElementCount > 500) pre.removeChild(pre.firstChild);
+  pre.scrollTop = pre.scrollHeight;
+}
+async function loadLog(){
+  let r;
+  try{ r = await (await api('/api/log?after=' + LOG_SEQ)).json(); }
+  catch(e){ return; }
+  if(!r || r.error) return;
+  (r.entries || []).forEach(appendLog);
+  if(r.next) LOG_SEQ = r.next;
+}
+function startLogPolling(){
+  if(LOG_TIMER) return;
+  loadLog();
+  LOG_TIMER = setInterval(loadLog, 3000);
+}
+function stopLogPolling(){ if(LOG_TIMER){ clearInterval(LOG_TIMER); LOG_TIMER = null; } }
+function copyLog(){
+  const text = Array.from(document.getElementById('logPre').children)
+    .map(r => r.textContent).join('\n');
+  navigator.clipboard.writeText(text).then(() => toast('Logs copied'),
+                                           () => toast('Could not copy logs'));
+}
+function clearLog(){ document.getElementById('logPre').innerHTML = ''; }
+
 // One delegated listener instead of inline handlers: ids travel as element
 // data (HTML-escaped attributes) and are never interpolated into generated
 // JS source - inline "onclick=\"fn('${id}')\"" patterns are an injection trap
@@ -1056,6 +1110,9 @@ loadNetwork().then(() => {
   if(NETWORK && NETWORK.needs_onboarding) openNetworkModal();
   else maybeOnboardUpdate();      // no connection prompt -> offer the update one
 });
+const logPanel = document.getElementById('logPanel');
+if(logPanel) logPanel.addEventListener('toggle',
+  () => logPanel.open ? startLogPolling() : stopLogPolling());
 TIMERS.push(setInterval(load_state, 4000));
 TIMERS.push(setInterval(loadPeers, 8000));
 TIMERS.push(setInterval(loadLan, 5000));
@@ -1063,6 +1120,13 @@ TIMERS.push(setInterval(loadNetwork, 15000));
 </script>
 </body></html>
 """
+
+# The favicon comes from the bundled/source icon (rpmap_config), not a pasted
+# blob, so the artwork lives in one place (``assets/rpmap.png``).
+_favicon = icon_data_uri()
+PAGE = PAGE.replace(
+    "<!--favicon-->",
+    f'<link rel="icon" type="image/png" href="{_favicon}">' if _favicon else "")
 
 
 def make_handler(engine: dict):
@@ -1228,6 +1292,16 @@ def make_handler(engine: dict):
                 status = _update_status(engine, refresh=bool(q.get("refresh")))
                 status["local"] = self._local_ok()
                 return self._json(status)
+
+            if u.path == "/api/log":
+                if not self._local_ok():
+                    return self._json({"error": "local only"}, 403)
+                try:
+                    after = int(q.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                items, nxt = rpmap_log.entries(after)
+                return self._json({"entries": items, "next": nxt})
 
             if u.path == "/api/preview":
                 mid = q.get("id", [""])[0]
@@ -1473,6 +1547,7 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
                secret: str | None = None, dev: bool = False,
                network: str | None = None,
                restore_on_exit: bool = False, window: bool = True) -> int:
+    rpmap_log.install()           # tee stdout/stderr into the in-memory ring
     cfg = load_config()
     if secret:
         cfg["session_secret"] = secret
@@ -1488,6 +1563,7 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
         host = "0.0.0.0"          # all interfaces; requests are gated by source IP
     ident = local_identity(cfg)
     token = secrets.token_urlsafe(16)
+    rpmap_log.set_secrets([token, cfg.get("session_secret") or ""])
     actual = _find_port(port) if host == "127.0.0.1" else port
     engine = {"cooked": cooked, "slot": slot, "token": token, "host": host,
               "secret": cfg["session_secret"], "cfg": cfg, "ident": ident,

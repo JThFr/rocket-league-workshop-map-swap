@@ -1,11 +1,12 @@
 """Configuration, identity and TLS bootstrap for rpmap.
 
 Constants and helpers shared by every other rpmap module: the slot tables, the
-on-disk config file, the app version and the system CA-bundle fallback.
+on-disk config file, the app version and icon, and the system CA-bundle fallback.
 """
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -87,6 +88,40 @@ def _read_app_version() -> str:
 
 
 APP_VERSION = _read_app_version()
+
+# The app icon (``assets/rpmap.png``). Packaged builds bundle it next to the
+# executable (``--add-data``); running from source reads it from the repo. It is
+# the web UI's favicon and the status window's icon.
+def _read_asset(relpath: str) -> bytes | None:
+    """Read a bundled/source asset (``sys._MEIPASS`` first, then the repo)."""
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(__file__).resolve().parents[1])
+    for root in roots:
+        try:
+            return (root / relpath).read_bytes()
+        except OSError:
+            continue
+    return None
+
+
+def app_icon_png() -> bytes | None:
+    """The app icon PNG bytes, or None if the asset can't be found."""
+    return _read_asset("assets/rpmap.png")
+
+
+def icon_png_b64() -> str:
+    """The app icon as base64 (for Tk's PhotoImage), or "" if unavailable."""
+    data = app_icon_png()
+    return base64.b64encode(data).decode("ascii") if data else ""
+
+
+def icon_data_uri() -> str:
+    """The app icon as a ``data:`` URI for the favicon, or "" if unavailable."""
+    b64 = icon_png_b64()
+    return "data:image/png;base64," + b64 if b64 else ""
 
 
 def config_path() -> Path:
