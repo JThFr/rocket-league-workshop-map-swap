@@ -511,7 +511,7 @@ function render(){
         <div class="meta"><span class="src">${esc(m.source)}</span><span class="muted">${fmtSize(m.size)}</span></div>
         <button class="primary useBtn" data-map-id="${esc(m.id)}" ${active?'disabled':''}>${active?'Loaded':'Load into slot'}</button>
       </div></div>`;
-  }).join('') || '<div class="muted">No maps found. Put .udk/.upk files in ~/maps, or subscribe on Steam Workshop.</div>';
+  }).join('') || '<div class="muted">No maps found. Put .udk/.upk files in ~/maps, or subscribe on Steam Workshop (Steam only; on Epic, download the map and drop it in ~/maps).</div>';
 }
 
 async function useMap(id){
@@ -661,8 +661,9 @@ async function doSync(mode, targets){
     let msg;
     if(b.error === 'not installed'){
       msg = (mode === 'pull')
-        ? "You don't have this map (get it from the Workshop first)"
-        : who + " doesn't have the map (needs a Workshop download)";
+        ? (b.url ? "You don't have this map (get it from the Workshop first)"
+                 : "You don't have this map yet")
+        : who + " doesn't have the map" + (b.url ? " (needs a Workshop download)" : "");
     } else if(b.error === 'version mismatch'){
       msg = 'Map content differs on ' + who + ' \u2014 not swapped';
     } else if(b.error === 'peer is on the stock map'){

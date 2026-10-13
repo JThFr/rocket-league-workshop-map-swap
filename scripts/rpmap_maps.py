@@ -45,6 +45,70 @@ def _steam_libraries() -> list[Path]:
     return libs
 
 
+def _epic_is_rocket_league(entry: dict) -> bool:
+    """Does an Epic manifest/install record describe Rocket League?"""
+    if str(entry.get("MandatoryAppFolderName") or "").strip().lower() == "rocketleague":
+        return True
+    if "rocket league" in str(entry.get("DisplayName") or "").lower():
+        return True
+    # "Sugar" is Rocket League's Epic catalogue codename.
+    return str(entry.get("AppName") or "").strip().lower() == "sugar"
+
+
+def _epic_installs() -> list[Path]:
+    """Rocket League install roots recorded by the Epic Games Launcher.
+
+    Two JSON sources under ``%ProgramData%\\Epic``, both carrying an absolute
+    ``InstallLocation`` (so a game on another drive is still found): the
+    per-game ``*.item`` manifests, and the launcher's ``LauncherInstalled.dat``.
+    Best effort and Windows-only in practice - an unreadable/absent file is just
+    skipped. Steam installs never go through here.
+    """
+    roots: list[Path] = []
+
+    def _add(location) -> None:
+        if not location:
+            return
+        p = Path(str(location))
+        if p not in roots:
+            roots.append(p)
+
+    programdata = Path(os.environ.get("ProgramData") or "C:/ProgramData")
+
+    manifests = programdata / "Epic/EpicGamesLauncher/Data/Manifests"
+    if manifests.is_dir():
+        for item in manifests.glob("*.item"):
+            try:
+                data = json.loads(item.read_text(errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and _epic_is_rocket_league(data):
+                _add(data.get("InstallLocation"))
+
+    installed = programdata / "Epic/UnrealEngineLauncher/LauncherInstalled.dat"
+    try:
+        data = json.loads(installed.read_text(errors="ignore"))
+        for entry in (data.get("InstallationList") or []):
+            if isinstance(entry, dict) and _epic_is_rocket_league(entry):
+                _add(entry.get("InstallLocation"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+
+    return roots
+
+
+# Last-resort locations, checked after the Steam library scan and the Epic
+# manifests: Steam first (this project's primary store), Epic after. Strings so
+# a test can neutralise them (a developer's machine may have a real install).
+_COOKED_FALLBACKS = (
+    "/var/mnt/storage/SteamLibrary/steamapps/common/rocketleague/TAGame/CookedPCConsole",
+    "~/.steam/steam/steamapps/common/rocketleague/TAGame/CookedPCConsole",
+    "~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/rocketleague/TAGame/CookedPCConsole",
+    "C:/Program Files/Epic Games/rocketleague/TAGame/CookedPCConsole",
+    "C:/Program Files (x86)/Epic Games/rocketleague/TAGame/CookedPCConsole",
+)
+
+
 def detect_cooked(override: str | None = None) -> Path | None:
     if override:
         p = Path(override)
@@ -53,14 +117,12 @@ def detect_cooked(override: str | None = None) -> Path | None:
     if env and Path(env).is_dir():
         return Path(env)
 
-    candidates: list[Path] = [
-        Path("/var/mnt/storage/SteamLibrary/steamapps/common/rocketleague/TAGame/CookedPCConsole"),
-        Path.home() / ".steam/steam/steamapps/common/rocketleague/TAGame/CookedPCConsole",
-        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/rocketleague/TAGame/CookedPCConsole",
-    ]
+    # Steam first (unchanged), then Epic Games Store.
+    candidates: list[Path] = [Path(p).expanduser() for p in _COOKED_FALLBACKS]
     for lib in _steam_libraries():
         candidates.append(lib / "steamapps/common/rocketleague/TAGame/CookedPCConsole")
-    candidates.append(Path("C:/Program Files/Epic Games/rocketleague/TAGame/CookedPCConsole"))
+    for root in _epic_installs():
+        candidates.append(root / "TAGame/CookedPCConsole")
     for c in candidates:
         if c.is_dir():
             return c
@@ -68,11 +130,18 @@ def detect_cooked(override: str | None = None) -> Path | None:
 
 
 def steamapps_from_cooked(cooked: Path) -> Path | None:
+    """The ``steamapps`` dir, only for a real Steam install (else None).
+
+    A Steam install ends in ``…/steamapps/common/rocketleague/TAGame/CookedPCConsole``.
+    An Epic Games Store install has the same ``rocketleague/TAGame`` tail but no
+    ``steamapps``, so it must not be taken for one - the Steam Workshop content
+    that :func:`list_maps` scans lives under ``steamapps``.
+    """
     try:
         sa = cooked.parents[3]
-        return sa if sa.is_dir() else None
     except IndexError:
         return None
+    return sa if sa.name == "steamapps" and sa.is_dir() else None
 
 
 # --------------------------------------------------------------------------- #
@@ -441,7 +510,7 @@ def use_map(cooked: Path, slot: str, src: Path) -> dict:
             raise RuntimeError(
                 "refusing to back up: the slot holds a custom map and no stock "
                 "backup exists. Restore the stock map first (Steam: Verify "
-                "integrity of game files)."
+                "integrity of game files; Epic: Verify in the launcher)."
             )
         shutil.copy2(slot_file, backup)
         eff = backup

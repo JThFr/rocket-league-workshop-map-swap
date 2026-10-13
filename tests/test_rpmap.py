@@ -537,6 +537,86 @@ class MapsTests(_CookedFixture):
         self.assertTrue(all("key" in e for e in inv))
 
 
+class InstallDetectionTests(unittest.TestCase):
+    """Steam and Epic Games Store install detection (Steam stays first)."""
+
+    def setUp(self):
+        self._pd = os.environ.get("ProgramData")
+        self._rlcooked = os.environ.pop("RL_COOKED", None)
+        self._saved = (maps._COOKED_FALLBACKS, maps._steam_libraries)
+        self.tmp = tempfile.TemporaryDirectory(prefix="rpmap-epic-")
+        self.root = Path(self.tmp.name)
+        maps._COOKED_FALLBACKS = ()            # ignore the developer's real installs
+        maps._steam_libraries = lambda: []
+        os.environ["ProgramData"] = str(self.root / "ProgramData")
+
+    def tearDown(self):
+        maps._COOKED_FALLBACKS, maps._steam_libraries = self._saved
+        if self._pd is None:
+            os.environ.pop("ProgramData", None)
+        else:
+            os.environ["ProgramData"] = self._pd
+        if self._rlcooked is not None:
+            os.environ["RL_COOKED"] = self._rlcooked
+        self.tmp.cleanup()
+
+    def _cooked(self, *parts) -> Path:
+        p = self.root.joinpath(*parts) / "TAGame/CookedPCConsole"
+        (p / "mods").mkdir(parents=True)
+        return p
+
+    def _item(self, name, data):
+        d = self.root / "ProgramData/Epic/EpicGamesLauncher/Data/Manifests"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(json.dumps(data))
+
+    def test_epic_record_matching(self):
+        self.assertTrue(maps._epic_is_rocket_league({"MandatoryAppFolderName": "rocketleague"}))
+        self.assertTrue(maps._epic_is_rocket_league({"DisplayName": "Rocket League"}))
+        self.assertTrue(maps._epic_is_rocket_league({"AppName": "Sugar"}))
+        self.assertFalse(maps._epic_is_rocket_league({"DisplayName": "Fortnite"}))
+        self.assertFalse(maps._epic_is_rocket_league({}))
+
+    def test_detect_cooked_finds_an_epic_manifest_install(self):
+        cooked = self._cooked("Games/rocketleague")
+        self._item("rl.item", {"MandatoryAppFolderName": "rocketleague",
+                               "DisplayName": "Rocket League",
+                               "InstallLocation": str(self.root / "Games/rocketleague")})
+        self.assertEqual(maps.detect_cooked(), cooked)
+
+    def test_detect_cooked_reads_launcher_installed_dat(self):
+        cooked = self._cooked("D/rocketleague")
+        d = self.root / "ProgramData/Epic/UnrealEngineLauncher"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "LauncherInstalled.dat").write_text(json.dumps(
+            {"InstallationList": [{"AppName": "Sugar",
+                                   "InstallLocation": str(self.root / "D/rocketleague")}]}))
+        self.assertEqual(maps.detect_cooked(), cooked)
+
+    def test_detect_cooked_ignores_non_rocket_league_manifests(self):
+        self._cooked("Games/fortnite")       # a Fortnite install, not RL
+        self._item("fn.item", {"DisplayName": "Fortnite",
+                               "InstallLocation": str(self.root / "Games/fortnite")})
+        self.assertIsNone(maps.detect_cooked())
+
+    def test_malformed_manifests_are_skipped(self):
+        d = self.root / "ProgramData/Epic/EpicGamesLauncher/Data/Manifests"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "broken.item").write_text("{ not json")
+        cooked = self._cooked("Games/rocketleague")
+        self._item("rl.item", {"AppName": "Sugar",
+                               "InstallLocation": str(self.root / "Games/rocketleague")})
+        self.assertEqual(maps.detect_cooked(), cooked)
+
+    def test_steamapps_from_cooked_only_matches_a_steam_layout(self):
+        steam = self.root / "Steam/steamapps/common/rocketleague/TAGame/CookedPCConsole"
+        steam.mkdir(parents=True)
+        self.assertEqual(maps.steamapps_from_cooked(steam),
+                         self.root / "Steam/steamapps")
+        epic = self._cooked("Epic Games/rocketleague")
+        self.assertIsNone(maps.steamapps_from_cooked(epic))
+
+
 class HttpTests(_CookedFixture):
     """Drive the real HTTP server over a socket."""
 
