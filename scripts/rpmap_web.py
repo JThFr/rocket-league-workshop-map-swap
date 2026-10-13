@@ -21,11 +21,12 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
 import rpmap_lan
+import rpmap_update as update
 import rpmap_window
-from rpmap_config import (APP_VERSION, DEFAULT_PORT, MODE_LAN, MODE_TAILSCALE,
-                          NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO, TAILNET,
-                          clear_runtime, load_config, network_mode,
-                          network_mode_setting, new_secret, pid_alive,
+from rpmap_config import (APP_VERSION, DEFAULT_PORT, GITHUB_RELEASES_PAGE, MODE_LAN,
+                          MODE_TAILSCALE, NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO,
+                          TAILNET, auto_update_setting, clear_runtime, load_config,
+                          network_mode, network_mode_setting, new_secret, pid_alive,
                           read_runtime, save_config, write_runtime)
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
@@ -108,6 +109,73 @@ def _peers_manual_set(engine: dict, payload: dict) -> dict:
     cfg["manual_peers"] = manual
     save_config(cfg)
     return {"ok": True, "manual_peers": manual}
+
+
+# --------------------------------------------------------------------------- #
+# Updates (opt-in self-update consent + a manual check/apply control)
+# --------------------------------------------------------------------------- #
+
+UPDATE_CACHE_TTL = 60.0          # seconds to reuse a GitHub release check
+
+
+def _update_status(engine: dict, refresh: bool = False) -> dict:
+    """The auto-update setting plus (cached) release info for the UI.
+
+    ``needs_onboarding`` is true only on a *packaged* build - the only place a
+    self-update can happen - so source checkouts never get the trust prompt.
+    A release check is a network call, so it only happens when the user asks
+    (``refresh``) or has opted into auto-updates; otherwise the last cached
+    result is reported (``checked`` says whether there is one).
+    """
+    cfg = engine.get("cfg") or {}
+    setting = auto_update_setting(cfg)
+    can_self_update = update._update_target() is not None
+
+    cache = engine.get("update_cache")
+    fresh = bool(cache) and (time.time() - cache.get("at", 0)) < UPDATE_CACHE_TTL
+    if refresh or (setting is True and not fresh):
+        cache = engine["update_cache"] = {"at": time.time(),
+                                          "info": update.check_for_update()}
+    return {
+        "current": APP_VERSION,
+        "auto_update": setting,
+        "configured": setting is not None,
+        "can_self_update": can_self_update,
+        "releases_url": GITHUB_RELEASES_PAGE,
+        "needs_onboarding": setting is None and can_self_update,
+        "checked": cache is not None,
+        "info": cache.get("info") if cache else None,
+    }
+
+
+def _update_set(engine: dict, payload: dict) -> dict:
+    enabled = bool(payload.get("enabled"))
+    cfg = engine.setdefault("cfg", {})
+    cfg["auto_update"] = enabled
+    save_config(cfg)
+    return {"ok": True, "update": _update_status(engine)}
+
+
+def _update_apply(engine: dict) -> dict:
+    """Download and install a newer release, then restart. Packaged builds only.
+
+    ``update.apply_update`` replaces the running build and terminates this
+    process, so it runs on a daemon thread *after* the reply is sent.
+    """
+    if update._update_target() is None:
+        return {"ok": False, "applying": False,
+                "error": f"this build can't self-update - download it from "
+                         f"{GITHUB_RELEASES_PAGE}"}
+    info = update.check_for_update()
+    if not info:
+        return {"ok": False, "applying": False, "error": "no newer release found"}
+    reason = update._update_refusal(info)
+    if reason:
+        return {"ok": False, "applying": False,
+                "error": f"{reason} - download it from {GITHUB_RELEASES_PAGE}"}
+    threading.Thread(target=update.apply_update, args=(info,), daemon=True).start()
+    return {"ok": True, "applying": True, "tag": info.get("tag"),
+            "version": info.get("version")}
 
 
 # --------------------------------------------------------------------------- #
@@ -283,6 +351,8 @@ PAGE = r"""<!doctype html>
 <header>
   <h1>rpmap</h1>
   <span class="muted" id="verLabel"></span>
+  <span class="badge b-custom" id="updateBadge" style="display:none;cursor:pointer"
+        onclick="scrollToUpdate()" title="A newer rpmap release is available">update available</span>
   <span class="grow"></span>
   <span class="muted" id="pathLabel"></span>
   <button class="danger" id="quitBtn" onclick="quitApp()" title="Stop the rpmap server">Quit</button>
@@ -325,6 +395,27 @@ PAGE = r"""<!doctype html>
       <button onclick="openNetworkModal()">Change</button>
     </div>
     <div class="muted" id="networkHint" style="margin-top:6px"></div>
+  </div>
+
+  <div class="panel" id="updatePanel">
+    <div class="row">
+      <b>Updates</b>
+      <span class="grow"></span>
+      <span class="muted" id="updateStatus">checking...</span>
+      <a id="releaseLink" style="display:none;color:#79c0ff" target="_blank"
+         rel="noopener noreferrer">View release &#8599;</a>
+      <button id="updateNowBtn" class="primary" style="display:none" onclick="applyUpdate()">Update now</button>
+      <button onclick="checkUpdates()">Check for updates</button>
+    </div>
+    <div class="row" id="autoUpdateRow" style="margin-top:10px">
+      <label class="muted" title="Install new releases automatically on startup">
+        <input type="checkbox" id="autoUpdateBox" onchange="toggleAutoUpdate()">
+        Install updates automatically
+      </label>
+      <span class="grow"></span>
+      <span class="muted" id="autoUpdateNote"></span>
+    </div>
+    <div class="muted" id="updateHint" style="margin-top:6px"></div>
   </div>
 
   <div class="panel">
@@ -415,6 +506,24 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 </div>
+
+<div class="modal-back" id="updateModal" style="display:none">
+  <div class="modal">
+    <h2>Allow automatic updates?</h2>
+    <p class="muted" style="margin:6px 0 0">
+      rpmap can check GitHub for new releases and install them automatically, replacing the app
+      and restarting. That means <b>trusting the owner of the repository
+      (<code>JThFr</code>)</b> to publish whatever they want. Downloads are
+      <b>sha256-verified</b> and only accepted from this project&#39;s official GitHub releases.
+      You can change this any time under <b>Updates</b>.
+    </p>
+    <div class="muted" id="updateModalLink" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:14px">
+      <button onclick="saveUpdateAuto(false)">No, I&#39;ll update manually</button>
+      <button class="primary" onclick="saveUpdateAuto(true)">Enable auto-updates</button>
+    </div>
+  </div>
+</div>
 <script>
 let STATE = null;
 let TIMERS = [];        // poll intervals, cleared when the user quits
@@ -422,6 +531,7 @@ let COMMON = null;      // map keys that every reachable peer has, or null
 let ARENA = 'the arena';
 let ARENA_NOTE = '';
 let NETWORK = null;     // {mode, tailscale_available, tailnet_ip, lan_ip, ...}
+let UPDATE = null;      // {current, auto_update, can_self_update, info, ...}
 const token = new URLSearchParams(location.search).get('token') || '';
 const api = (p, opts={}) => fetch(p + (p.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token), opts);
 const prevUrl = id => '/api/preview?id=' + encodeURIComponent(id) + '&token=' + encodeURIComponent(token);
@@ -780,6 +890,7 @@ async function saveNetworkMode(force){
     renderNetwork();
     toast('Connection: ' + modeLabel(mode));
     loadPeers(); loadLan();
+    maybeOnboardUpdate();     // one onboarding at a time: updates come after connection
   } else toast('Error: ' + (r.error || 'failed'));
 }
 async function addManualPeer(){
@@ -800,6 +911,113 @@ async function removeManualPeer(ip){
   if(r.ok){ toast('Peer removed'); loadPeers(); } else toast('Error: ' + (r.error || 'failed'));
 }
 
+// --- updates (opt-in self-update) ------------------------------------------
+function scrollToUpdate(){
+  const p = document.getElementById('updatePanel');
+  if(p) p.scrollIntoView({behavior:'smooth', block:'center'});
+}
+function renderUpdate(){
+  if(!UPDATE) return;
+  const info = UPDATE.info;
+  const status = document.getElementById('updateStatus');
+  if(!UPDATE.checked){
+    status.innerHTML = '<span class="muted">not checked</span>';
+  } else if(info){
+    status.innerHTML = 'New version <b>' + esc(info.tag) + '</b> available';
+  } else {
+    status.innerHTML = '<span class="badge b-stock">up to date</span> v' + esc(UPDATE.current);
+  }
+  document.getElementById('updateNowBtn').style.display = (info && UPDATE.can_self_update) ? '' : 'none';
+  const link = document.getElementById('releaseLink');
+  link.style.display = info ? '' : 'none';
+  if(info) link.href = info.url || UPDATE.releases_url;
+  document.getElementById('updateBadge').style.display = info ? '' : 'none';
+
+  const row = document.getElementById('autoUpdateRow');
+  if(UPDATE.can_self_update){
+    row.style.display = '';
+    document.getElementById('autoUpdateBox').checked = UPDATE.auto_update === true;
+    document.getElementById('autoUpdateNote').textContent =
+      UPDATE.auto_update === true ? 'on \u00b7 installs on startup'
+      : UPDATE.auto_update === false ? 'off' : 'not set';
+  } else {
+    row.style.display = 'none';
+  }
+
+  const hint = document.getElementById('updateHint');
+  if(!UPDATE.can_self_update){
+    hint.innerHTML = 'This is a source build, so it can\u2019t replace itself. New versions come '
+      + 'from the <a href="' + esc(UPDATE.releases_url) + '" target="_blank" '
+      + 'rel="noopener noreferrer" style="color:#79c0ff">GitHub releases</a>.';
+  } else if(info){
+    hint.innerHTML = 'Downloads are sha256-verified and only accepted from this project\u2019s '
+      + 'official GitHub releases.';
+  } else if(!UPDATE.checked){
+    hint.innerHTML = 'Click <b>Check for updates</b> to ask GitHub for the latest release.';
+  } else {
+    hint.innerHTML = UPDATE.auto_update === true
+      ? 'rpmap is up to date. New releases install automatically on startup.'
+      : 'rpmap is up to date.';
+  }
+}
+async function loadUpdate(){
+  try{ UPDATE = await (await api('/api/update')).json(); }catch(e){ return null; }
+  renderUpdate();
+  return UPDATE;
+}
+async function checkUpdates(){
+  toast('Checking for updates...');
+  try{ UPDATE = await (await api('/api/update?refresh=1')).json(); }
+  catch(e){ toast('Could not reach the server'); return; }
+  renderUpdate();
+  toast(UPDATE.info ? ('Update available: ' + UPDATE.info.tag) : 'rpmap is up to date');
+}
+async function toggleAutoUpdate(){
+  const enabled = document.getElementById('autoUpdateBox').checked;
+  const r = await (await api('/api/update/auto', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({enabled})})).json();
+  if(r.ok){ UPDATE = r.update; renderUpdate(); toast(enabled ? 'Auto-updates on' : 'Auto-updates off'); }
+  else { toast('Error: ' + (r.error || 'failed')); loadUpdate(); }
+}
+function openUpdateModal(){
+  const l = document.getElementById('updateModalLink');
+  if(UPDATE) l.innerHTML = 'Releases: <a href="' + esc(UPDATE.releases_url) + '" target="_blank" '
+    + 'rel="noopener noreferrer" style="color:#79c0ff">github.com/'
+    + esc(String(UPDATE.releases_url).split('github.com/')[1] || '') + '</a>.';
+  document.getElementById('updateModal').style.display = '';
+}
+async function saveUpdateAuto(enabled){
+  document.getElementById('updateModal').style.display = 'none';
+  const r = await (await api('/api/update/auto', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({enabled})})).json();
+  if(r.ok){
+    UPDATE = r.update; renderUpdate();
+    toast(enabled ? 'Auto-updates enabled' : 'Auto-updates off \u2014 update manually');
+  } else toast('Error: ' + (r.error || 'failed'));
+}
+async function maybeOnboardUpdate(){
+  const u = await loadUpdate();
+  if(u && u.local && u.needs_onboarding) openUpdateModal();
+}
+async function applyUpdate(){
+  if(!confirm('Update rpmap now?\n\nIt downloads the new version, replaces the app, and restarts. '
+              + 'This page will lose its server.')) return;
+  const btn = document.getElementById('updateNowBtn');
+  btn.disabled = true; btn.textContent = 'Updating...';
+  let r;
+  try{ r = await (await api('/api/update/apply', {method:'POST'})).json(); }
+  catch(e){ toast('Update request failed'); btn.disabled = false; btn.textContent = 'Update now'; return; }
+  if(!r.ok){
+    toast('Error: ' + (r.error || 'failed'));
+    btn.disabled = false; btn.textContent = 'Update now';
+    return;
+  }
+  document.getElementById('updateStatus').innerHTML =
+    'Updating to <b>' + esc(r.tag || '') + '</b> and restarting...';
+  TIMERS.forEach(clearInterval);
+  toast('Updating and restarting \u2014 this page will stop responding. Reopen rpmap afterwards.', 9000);
+}
+
 // One delegated listener instead of inline handlers: ids travel as element
 // data (HTML-escaped attributes) and are never interpolated into generated
 // JS source - inline "onclick=\"fn('${id}')\"" patterns are an injection trap
@@ -818,6 +1036,7 @@ loadNetwork().then(() => {
   renderNetwork();
   loadPeers();
   if(NETWORK && NETWORK.needs_onboarding) openNetworkModal();
+  else maybeOnboardUpdate();      // no connection prompt -> offer the update one
 });
 TIMERS.push(setInterval(load_state, 4000));
 TIMERS.push(setInterval(loadPeers, 8000));
@@ -987,6 +1206,11 @@ def make_handler(engine: dict):
             if u.path == "/api/network":
                 return self._json(_network_status(engine))
 
+            if u.path == "/api/update":
+                status = _update_status(engine, refresh=bool(q.get("refresh")))
+                status["local"] = self._local_ok()
+                return self._json(status)
+
             if u.path == "/api/preview":
                 mid = q.get("id", [""])[0]
                 m = next((x for x in list_maps(cooked) if x["id"] == mid), None)
@@ -1049,6 +1273,14 @@ def make_handler(engine: dict):
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)
                     return self._json(_network_set(engine, payload))
+                if u.path == "/api/update/auto":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_update_set(engine, payload))
+                if u.path == "/api/update/apply":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_update_apply(engine))
                 if u.path == "/api/peers/manual":
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)

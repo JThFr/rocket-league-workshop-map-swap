@@ -32,6 +32,7 @@ import rpmap_peers as peers
 import rpmap_update as update
 import rpmap_web as web
 import rpmap_window as window
+import rpmap
 
 SLOT_FILE = config.SLOTS["underpass"][0]
 PACKAGE_TAG = 0x9E2A83C1
@@ -838,6 +839,106 @@ class HttpTests(_CookedFixture):
                             body={"mode": "warp"})
         self.assertFalse(json.loads(body)["ok"])
 
+    # --- updates: consent gate + manual check/apply ------------------------ #
+
+    def _patch_update(self, info=None, target=None, refusal=None):
+        """Stub the release path so /api/update* never hits GitHub or installs."""
+        saved = (web.update.check_for_update, web.update._update_target,
+                 web.update._update_refusal, web.update.apply_update)
+        web.update.check_for_update = lambda: info
+        web.update._update_target = lambda: target
+        web.update._update_refusal = lambda i: refusal
+        self.applied = []
+        web.update.apply_update = lambda i: self.applied.append(i)
+        self.addCleanup(self._unpatch_update, saved)
+
+    @staticmethod
+    def _unpatch_update(saved):
+        (web.update.check_for_update, web.update._update_target,
+         web.update._update_refusal, web.update.apply_update) = saved
+
+    def test_update_status_shape(self):
+        self._patch_update(info=None, target=None)          # source build
+        status, body = self._req("GET", "/api/update?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["current"], config.APP_VERSION)
+        self.assertIsNone(data["auto_update"])
+        self.assertFalse(data["configured"])
+        self.assertFalse(data["can_self_update"])
+        self.assertFalse(data["needs_onboarding"])          # only packaged builds ask
+        self.assertFalse(data["checked"])                   # nothing hit GitHub yet
+        self.assertTrue(data["local"])
+        self.assertIn("releases_url", data)
+        self.assertIsNone(data["info"])
+
+    def test_update_status_does_not_ask_github_until_told_to(self):
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        calls = []
+        web.update.check_for_update = lambda: calls.append(1) or None
+        _, body = self._req("GET", "/api/update?token=" + self.TOKEN)
+        self.assertFalse(json.loads(body)["checked"])
+        self.assertEqual(calls, [])
+        _, body = self._req("GET", "/api/update?refresh=1&token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["checked"])
+        self.assertEqual(len(calls), 1)
+
+    def test_update_needs_onboarding_on_a_packaged_build(self):
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        _, body = self._req("GET", "/api/update?token=" + self.TOKEN)
+        data = json.loads(body)
+        self.assertTrue(data["can_self_update"])
+        self.assertTrue(data["needs_onboarding"])
+
+    def test_update_auto_set_is_local_and_persists(self):
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        status, body = self._req("POST", "/api/update/auto?token=" + self.TOKEN,
+                                 body={"enabled": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertIs(config.auto_update_setting(config.load_config()), True)
+
+    def test_update_apply_refused_when_not_packaged(self):
+        self._patch_update(info={"tag": "v9.9.9", "version": "9.9.9", "url": "u"},
+                           target=None)
+        status, body = self._req("POST", "/api/update/apply?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("self-update", data["error"])
+        self.assertEqual(self.applied, [])
+
+    def test_update_apply_refused_without_a_release(self):
+        self._patch_update(info=None, target=(Path("/tmp/rpmap"), "file"))
+        _, body = self._req("POST", "/api/update/apply?token=" + self.TOKEN)
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertEqual(self.applied, [])
+
+    def test_update_apply_reports_the_refusal_reason(self):
+        self._patch_update(info={"tag": "v9.9.9", "version": "9.9.9", "url": "u"},
+                           target=(Path("/tmp/rpmap"), "file"),
+                           refusal="the download URL is not an official release asset")
+        _, body = self._req("POST", "/api/update/apply?token=" + self.TOKEN)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("official", data["error"])
+        self.assertEqual(self.applied, [])
+
+    def test_update_apply_starts_when_packaged_and_verified(self):
+        self._patch_update(info={"tag": "v9.9.9", "version": "9.9.9", "url": "u"},
+                           target=(Path("/tmp/rpmap"), "file"), refusal=None)
+        status, body = self._req("POST", "/api/update/apply?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["applying"])
+        self.assertEqual(data["tag"], "v9.9.9")
+        for _ in range(100):                 # apply_update runs on a daemon thread
+            if self.applied:
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(self.applied), 1)
+
     def test_manual_peer_add_update_and_remove(self):
         _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,
                             body={"ip": "192.168.1.20", "name": "bud"})
@@ -1127,6 +1228,52 @@ class NetworkModeTests(unittest.TestCase):
             self.assertEqual(ipaddress.ip_address(ip).version, 4)
 
 
+class AutoUpdateConfigTests(unittest.TestCase):
+    """`auto_update` unset (ask) vs. explicitly true/false (never ask again)."""
+
+    def test_unset_is_none(self):
+        self.assertIsNone(config.auto_update_setting({}))
+        self.assertIsNone(config.auto_update_setting(None))
+        self.assertIsNone(config.auto_update_setting({"auto_update": "yes"}))
+        self.assertIsNone(config.auto_update_setting({"auto_update": 1}))
+
+    def test_bool_values_round_trip(self):
+        self.assertTrue(config.auto_update_setting({"auto_update": True}))
+        self.assertFalse(config.auto_update_setting({"auto_update": False}))
+
+
+class StartupUpdateGateTests(unittest.TestCase):
+    """Auto-update runs on startup only after the user opts in."""
+
+    def setUp(self):
+        self._saved = (rpmap.running_instance, rpmap.maybe_self_update,
+                       rpmap.load_config, rpmap.detect_cooked)
+        rpmap.running_instance = lambda: None
+        rpmap.detect_cooked = lambda cooked=None: None     # bail out after the gate
+        self.calls = []
+        rpmap.maybe_self_update = lambda auto: self.calls.append(auto)
+
+    def tearDown(self):
+        (rpmap.running_instance, rpmap.maybe_self_update,
+         rpmap.load_config, rpmap.detect_cooked) = self._saved
+
+    def _run(self, cfg):
+        rpmap.load_config = lambda: cfg
+        return rpmap.main(["serve", "--no-window"])
+
+    def test_unset_never_checks(self):
+        self._run({})
+        self.assertEqual(self.calls, [])
+
+    def test_disabled_never_checks(self):
+        self._run({"auto_update": False})
+        self.assertEqual(self.calls, [])
+
+    def test_enabled_checks_and_installs(self):
+        self._run({"auto_update": True})
+        self.assertEqual(self.calls, [True])
+
+
 class RuntimeFileTests(unittest.TestCase):
     """The runtime record: round-trip, permissions, pid-guarded removal."""
 
@@ -1204,6 +1351,32 @@ class DoctorTests(unittest.TestCase):
             finally:
                 (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
                  doctor.update.check_for_update) = saved
+
+    def test_reports_the_auto_update_setting(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory(prefix="rpmap-doctor-") as d:
+            cooked = Path(d) / "TAGame" / "CookedPCConsole"
+            (cooked / "mods").mkdir(parents=True)
+            (cooked / config.SLOTS["underpass"][0]).write_bytes(b"STOCK")
+            saved = (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
+                     doctor.update.check_for_update)
+            doctor.peers.tailscale_peers = lambda cfg=None: []
+            doctor.peers.tailscale_self = lambda: {"ips": []}
+            doctor.update.check_for_update = lambda: None
+            cfg = config.load_config()
+            cfg["auto_update"] = True
+            config.save_config(cfg)
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    doctor.run(str(cooked), "underpass")
+                self.assertIn("auto-update: enabled", buf.getvalue())
+            finally:
+                (doctor.peers.tailscale_peers, doctor.peers.tailscale_self,
+                 doctor.update.check_for_update) = saved
+                cfg.pop("auto_update", None)
+                config.save_config(cfg)
 
 
 def _free_port() -> int:

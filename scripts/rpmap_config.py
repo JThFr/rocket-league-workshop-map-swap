@@ -125,6 +125,16 @@ def network_mode(cfg: dict | None = None) -> str:
     return network_mode_setting(cfg) or DEFAULT_NETWORK_MODE
 
 
+def auto_update_setting(cfg: dict | None = None) -> bool | None:
+    """The stored auto-update choice: True, False, or None if never asked.
+
+    ``None`` is what drives the first-run consent popup: the app must not
+    install (or even check for) updates until the user has answered.
+    """
+    value = (cfg or {}).get("auto_update") if isinstance(cfg, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 def new_secret() -> str:
     """A short, human-typeable session code (64 bits, grouped 4-4-4-4)."""
     h = secrets.token_hex(8)

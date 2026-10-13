@@ -195,22 +195,33 @@ Exit code is non-zero only when a hard check fails (e.g. Rocket League not found
 - `RL_MAPS` — extra folder of `.udk`/`.upk` maps (default `~/maps`).
 - Per-user config lives in `%APPDATA%\rpmap\config.json` (Windows) or
   `~/.config/rpmap/config.json` (Linux); preview cache in the matching local cache dir.
-  It holds `network_mode` (`tailscale` or `lan`), the `session_secret`, the display
-  `name`, and any `manual_peers` (used in local-network mode).
+  It holds `network_mode` (`tailscale` or `lan`), `auto_update` (`true`/`false`, unset until
+  answered), the `session_secret`, the display `name`, and any `manual_peers` (used in
+  local-network mode).
 - While the UI is running it also writes `runtime.json` next to the config (mode `0600`, removed
   on a clean exit) so `rpmap stop` and a second launch can find the live server. It holds this
   run's UI token, which is regenerated every time the server starts.
 
 ## Updates
 
-A packaged build checks GitHub Releases **on startup**. If a newer version exists it downloads
-the matching asset (`rpmap.exe` / `rpmap-x86_64.AppImage`) and replaces itself:
+Auto-updates are **opt-in**. On first launch a packaged build asks whether to allow them,
+making clear that enabling it means **trusting the owner of the repository** (`JThFr`) to
+publish whatever they want; downloads are sha256-verified and only accepted from this
+project's official GitHub releases. Until you answer, rpmap does **not** contact GitHub —
+and if you decline, it never checks on startup (you can still check manually in the UI).
+
+With auto-update **on**, a packaged build checks GitHub Releases on startup. If a newer
+version exists it downloads the matching asset (`rpmap.exe` / `rpmap-x86_64.AppImage`) and
+replaces itself:
 
 - **Windows:** a tiny helper waits for the process to exit, swaps the `.exe`, and relaunches.
 - **Linux (AppImage or binary):** the file is replaced in place and the new build is started.
 
-Running from source (the `.py`) never self-updates — it only prints the available version.
-Skip the startup check with `--no-update-check`, or run it manually with `check-update`.
+The web UI's **Updates** panel shows the current version and the auto-update state, with a
+**Check for updates** button and, when a newer release exists, **Update now** and a link to
+the GitHub release. Running from source (the `.py`) never self-updates — it only offers the
+check and the release link. `--no-update-check` skips the startup check entirely, and
+`rpmap check-update` checks from the command line.
 
 The relaunched build is detached (no terminal), so once it's up you stop it with the UI's
 **Quit** button or `rpmap stop` — not Ctrl+C.
