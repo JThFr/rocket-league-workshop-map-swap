@@ -20,7 +20,7 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
       - name: Build exe
-        run: pyinstaller --onefile --console --name rpmap --add-data "VERSION;." scripts/rpmap.py
+        run: pyinstaller --onefile --console --name rpmap --add-data "VERSION;." --add-data "assets/rpmap.png;assets" scripts/rpmap.py
       - name: Smoke-test the exe
         run: |
           $expected = "rpmap $(Get-Content VERSION)"
@@ -45,7 +45,7 @@ jobs:
       - name: Build one-file binary
         run: |
           python -m pip install --upgrade pip pyinstaller
-          pyinstaller --onefile --console --name rpmap --add-data "VERSION:." scripts/rpmap.py
+          pyinstaller --onefile --console --name rpmap --add-data "VERSION:." --add-data "assets/rpmap.png:assets" scripts/rpmap.py
       - name: Assemble AppDir
         run: |
           set -euo pipefail

@@ -82,6 +82,12 @@ the running one instead of starting a second server.
 Every map gets a preview: the map's own image when it ships one, otherwise fetched once from
 Steam's public workshop API and cached.
 
+The **Logs** panel (collapsed by default) shows this machine's recent server output — the
+startup banner, LAN relay activity, self-update results and errors — which is otherwise
+invisible when rpmap runs detached (a self-update relaunch, or `--no-window`). It is served
+to this machine only, with the UI token and session code redacted. The browser tab and the
+status window use the rpmap icon.
+
 ## Connection modes
 
 rpmap reaches peers one of two ways; the **Connection** panel in the web UI (or

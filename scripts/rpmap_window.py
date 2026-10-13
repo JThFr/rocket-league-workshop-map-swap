@@ -23,12 +23,28 @@ from __future__ import annotations
 
 import os
 
+from rpmap_config import icon_png_b64
+
 # Background/foreground colours, matched to the web UI.
 _BG = "#161b22"
 _FG = "#c9d1d9"
 _MUTED = "#8b949e"
 _WHITE = "#f0f6fc"
 _ACCENT = "#2ea043"
+
+
+def _apply_icon(root) -> None:
+    """Best-effort window/taskbar icon from the bundled app icon."""
+    b64 = icon_png_b64()
+    if not b64:
+        return
+    try:
+        import tkinter as tk
+        image = tk.PhotoImage(data=b64)
+        root.iconphoto(True, image)
+        root._rpmap_icon = image          # keep a reference; Tk does not hold it
+    except Exception:
+        pass
 
 
 def available() -> bool:
@@ -64,6 +80,7 @@ def run(*, version: str, status_fn, on_open, on_restore, on_quit,
 
     root = tk.Tk()
     root.title(f"rpmap {version}")
+    _apply_icon(root)
     root.resizable(False, False)
     root.configure(bg=_BG)
 

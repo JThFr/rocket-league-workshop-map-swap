@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import rpmap_config as config
 import rpmap_doctor as doctor
 import rpmap_lan as lan
+import rpmap_log as log
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -253,6 +254,115 @@ class CaBundleTests(unittest.TestCase):
         config.CA_BUNDLE_CANDIDATES = ("/etc/ssl/certs/ca-certificates.crt",)
         self.assertIsNone(config.ensure_ca_bundle())
         self.assertEqual(os.environ["SSL_CERT_FILE"], "/custom/ca.pem")
+
+
+class IconTests(unittest.TestCase):
+    """The app icon is read from the asset (bundled or repo), not hardcoded."""
+
+    def test_source_icon_is_the_committed_png(self):
+        data = config.app_icon_png()
+        self.assertIsNotNone(data)
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        on_disk = (ROOT / "assets" / "rpmap.png").read_bytes()
+        self.assertEqual(data, on_disk)
+
+    def test_data_uri_is_a_png_data_uri(self):
+        self.assertTrue(config.icon_data_uri().startswith("data:image/png;base64,"))
+
+    def test_meipass_is_preferred(self):
+        """A packaged build reads the icon out of ``sys._MEIPASS``."""
+        with tempfile.TemporaryDirectory(prefix="rpmap-meipass-") as d:
+            asset = Path(d) / "assets" / "rpmap.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"\x89PNG\r\n\x1a\nBUNDLED")
+            had = hasattr(sys, "_MEIPASS")
+            old = getattr(sys, "_MEIPASS", None)
+            sys._MEIPASS = d
+            try:
+                self.assertEqual(config.app_icon_png(), b"\x89PNG\r\n\x1a\nBUNDLED")
+            finally:
+                if had:
+                    sys._MEIPASS = old
+                else:
+                    del sys._MEIPASS
+
+    def test_page_carries_the_favicon(self):
+        self.assertIn('rel="icon"', web.PAGE)
+        self.assertIn("data:image/png;base64,", web.PAGE)
+        self.assertNotIn("<!--favicon-->", web.PAGE)
+
+
+class LogTests(unittest.TestCase):
+    """The in-memory log ring and the stdout/stderr tee."""
+
+    def setUp(self):
+        with log._lock:
+            log._entries.clear()
+        log.set_secrets([])
+
+    def tearDown(self):
+        log.set_secrets([])
+
+    def test_add_and_page_by_seq(self):
+        log.add("one")
+        log.add("two")
+        got, newest = log.entries(0)
+        self.assertEqual([e["msg"] for e in got], ["one", "two"])
+        self.assertEqual(newest, got[-1]["seq"])
+        later, _ = log.entries(got[0]["seq"])
+        self.assertEqual([e["msg"] for e in later], ["two"])
+
+    def test_ring_wraps_at_maxlen(self):
+        for i in range(log.MAXLEN + 5):
+            log.add(f"line-{i}")
+        got, _ = log.entries(0)
+        self.assertEqual(len(got), log.MAXLEN)
+        self.assertEqual(got[0]["msg"], "line-5")          # oldest dropped
+
+    def test_registered_secrets_are_redacted(self):
+        log.set_secrets(["s3cr3t", "tok-123"])
+        log.add("session s3cr3t and token=tok-123 here")
+        got, _ = log.entries(0)
+        self.assertNotIn("s3cr3t", got[0]["msg"])
+        self.assertNotIn("tok-123", got[0]["msg"])
+        self.assertIn("redacted", got[0]["msg"])
+
+    def test_tee_passes_through_and_buffers_partial_lines(self):
+        import io
+        sink = io.StringIO()
+        tee = log._Tee(sink, "info")
+        tee.write("hello\nworld\npart")
+        self.assertEqual(sink.getvalue(), "hello\nworld\npart")
+        msgs = [e["msg"] for e in log.entries(0)[0]]
+        self.assertEqual(msgs, ["hello", "world"])         # "part" not flushed yet
+        tee.write("ial\n")
+        msgs = [e["msg"] for e in log.entries(0)[0]]
+        self.assertIn("partial", msgs)
+
+    def test_stderr_lines_are_tagged_as_errors(self):
+        import io
+        tee = log._Tee(io.StringIO(), "error")
+        tee.write("boom\n")
+        self.assertEqual(log.entries(0)[0][0]["level"], "error")
+
+    def test_install_is_idempotent_and_captures_print(self):
+        import io
+        saved_out, saved_err = sys.stdout, sys.stderr
+        saved_installed = log._installed
+        try:
+            log._installed = False
+            sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+            log.install()
+            first = sys.stdout
+            log.install()                       # second call must not re-wrap
+            self.assertIs(sys.stdout, first)
+            print("hello-from-install")
+            self.assertIn("hello-from-install", sys.stdout.getvalue())
+            self.assertIn("hello-from-install",
+                          [e["msg"] for e in log.entries(0)[0]])
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+            log._installed = saved_installed
 
 
 class PeerTests(unittest.TestCase):
@@ -982,6 +1092,27 @@ class HttpTests(_CookedFixture):
         self.assertIn("local-network", data["error"])
         _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
         self.assertFalse(json.loads(body)["available"])
+
+    # --- logs: the in-memory ring, served locally -------------------------- #
+
+    def test_log_endpoint_pages_and_redacts(self):
+        with log._lock:
+            log._entries.clear()
+        log.set_secrets(["supersecret"])
+        log.add("first line")
+        log.add("token=supersecret leaked?")
+        status, body = self._req("GET", "/api/log?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        msgs = [e["msg"] for e in data["entries"]]
+        self.assertIn("first line", msgs)
+        self.assertTrue(any("redacted" in m for m in msgs))
+        self.assertFalse(any("supersecret" in m for m in msgs))
+        first_seq = data["entries"][0]["seq"]
+        _, body = self._req("GET", f"/api/log?after={first_seq}&token=" + self.TOKEN)
+        later = [e["msg"] for e in json.loads(body)["entries"]]
+        self.assertNotIn("first line", later)
+        log.set_secrets([])
 
 
 class EveryoneFilterTests(unittest.TestCase):
