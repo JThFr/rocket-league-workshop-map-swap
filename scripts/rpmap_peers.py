@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ipaddress
 import json
 import shutil
 import socket
@@ -11,7 +12,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from rpmap_config import APP_VERSION, DEFAULT_PORT, PRODUCT
+from rpmap_config import (APP_VERSION, DEFAULT_PORT, MODE_LAN, PRODUCT,
+                          network_mode)
 from rpmap_maps import (_slot_paths, file_hash, find_map_by, map_inventory,
                         slot_state, use_map, workshop_url)
 
@@ -42,7 +44,61 @@ def tailscale_self() -> dict:
     }
 
 
+def tailscale_installed() -> bool:
+    """True when the ``tailscale`` CLI is on PATH (cheap; no subprocess)."""
+    return shutil.which("tailscale") is not None
+
+
+def local_ipv4s() -> list[str]:
+    """This machine's own IPv4 addresses, primary route first (best effort).
+
+    Used in local-network mode for identity and for the UI's Host allow-list.
+    The first entry comes from the UDP-connect trick (no packet is sent - the
+    kernel just picks the route); hostname resolution adds any further
+    addresses. Pure standard library, never raises.
+    """
+    ips: list[str] = []
+
+    def _add(ip: str) -> None:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return
+        if addr.version == 4 and not addr.is_loopback and not addr.is_link_local:
+            if str(addr) not in ips:
+                ips.append(str(addr))
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            _add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            _add(info[4][0])
+    except OSError:
+        pass
+    return ips
+
+
 def local_identity(cfg: dict) -> dict:
+    """Who this machine is, in the current network mode.
+
+    Tailscale mode uses the tailnet hostname/IP; local-network mode uses the
+    machine name and its LAN address, and never shells out to ``tailscale``.
+    """
+    if network_mode(cfg) == MODE_LAN:
+        peer_id = socket.gethostname()
+        return {
+            "peer_id": peer_id,
+            "name": cfg.get("display_name") or peer_id,
+            "dns": "",
+            "ips": local_ipv4s(),
+        }
     node = tailscale_self()
     peer_id = node.get("peer_id") or socket.gethostname()
     return {
@@ -53,14 +109,26 @@ def local_identity(cfg: dict) -> dict:
     }
 
 
+def _manual_peers(cfg: dict | None, seen: set[str]) -> list[dict]:
+    """The configured manual peers, skipping any ``seen`` name already present."""
+    out: list[dict] = []
+    for m in (cfg or {}).get("manual_peers") or []:
+        key = (m.get("name") or m.get("ip") or "").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"peer_id": m.get("name"), "name": m.get("name"), "dns": "",
+                    "ip": m.get("ip"), "port": m.get("port"), "manual": True,
+                    "online": True, "os": m.get("os")})
+    return out
+
+
 def tailscale_peers(cfg: dict | None = None) -> list[dict]:
     """Tailnet peers (`tailscale status --json`), merged with any manual peers."""
     peers: list[dict] = []
-    seen: set[str] = set()
     for _id, p in (_tailscale_status().get("Peer") or {}).items():
         ips = [ip for ip in (p.get("TailscaleIPs") or []) if ":" not in ip]
         name = p.get("HostName")
-        seen.add((name or "").lower())
         peers.append({
             "peer_id": name,
             "name": name,
@@ -70,14 +138,22 @@ def tailscale_peers(cfg: dict | None = None) -> list[dict]:
             "online": bool(p.get("Online")),
             "os": p.get("OS"),
         })
-    for m in (cfg or {}).get("manual_peers") or []:
-        key = (m.get("name") or m.get("ip") or "").lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        peers.append({"peer_id": m.get("name"), "name": m.get("name"), "dns": "",
-                      "ip": m.get("ip"), "port": m.get("port"),
-                      "online": True, "os": m.get("os")})
+    peers.extend(_manual_peers(cfg, {(p["name"] or "").lower() for p in peers}))
+    peers.sort(key=lambda x: (x["name"] or ""))
+    return peers
+
+
+def known_peers(cfg: dict | None = None) -> list[dict]:
+    """The peer roster to use in the current network mode.
+
+    Tailscale mode is the full tailnet + manual list (:func:`tailscale_peers`);
+    local-network mode has no tailnet, so it is the manual peers only - which is
+    also the security boundary for sync targets.
+    """
+    cfg = cfg or {}
+    if network_mode(cfg) != MODE_LAN:
+        return tailscale_peers(cfg)
+    peers = _manual_peers(cfg, set())
     peers.sort(key=lambda x: (x["name"] or ""))
     return peers
 
@@ -130,6 +206,7 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> 
     row = {
         "peer_id": p.get("peer_id"), "name": p.get("name"), "ip": p.get("ip"),
         "online": bool(p.get("online")), "rpmap": False, "port": pport,
+        "manual": bool(p.get("manual")),
         "slot": None, "sha256": None, "in_sync": "unknown", "version": None,
         "map_count": None,
         # Why we couldn't reach it (kept meaningful for reachable rows too).
@@ -158,7 +235,7 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
     port = int(cfg.get("port") or DEFAULT_PORT)
     local = slot_state(cooked, slot)
     local_hash = local.get("sha256") or ""
-    peers = tailscale_peers(cfg)
+    peers = known_peers(cfg)
 
     roster: list[dict] = []
     if peers:
@@ -230,13 +307,14 @@ def _roster_targets(cfg: dict, default_port: int) -> dict[str, int]:
     """ip -> the port we may contact that peer on, for known roster peers.
 
     Sync targets must be peers this machine actually knows (the tailnet roster
-    from ``tailscale status``, plus any configured ``manual_peers``). Without
-    this check ``/api/sync`` would connect to any ``ip:port`` a caller names -
-    turning this machine into a request proxy and sending the shared session
-    secret to a host it was never meant for.
+    from ``tailscale status`` in Tailscale mode, or the configured
+    ``manual_peers`` in local-network mode). Without this check ``/api/sync``
+    would connect to any ``ip:port`` a caller names - turning this machine into
+    a request proxy and sending the shared session secret to a host it was never
+    meant for.
     """
     allowed: dict[str, int] = {}
-    for p in tailscale_peers(cfg):
+    for p in known_peers(cfg):
         ip = (p.get("ip") or "").strip()
         if not ip:
             continue

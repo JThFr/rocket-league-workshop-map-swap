@@ -60,6 +60,30 @@ Or run it from source — it's one script, standard library only.
 - Running from **source** instead? Then you also need **Python 3** (standard library only —
   no `pip install`).
 
+## Network modes — Tailscale or your own LAN
+
+On first launch rpmap asks how you connect. **Tailscale is the recommended default**
+and the mode the project is validated against; the alternative is there for people who
+prefer their own network.
+
+- **Tailscale (recommended, default).** A Layer-3 mesh VPN. Rocket League joins by
+  **IP : port**, so Tailscale's stable `100.x` address works directly — no LAN broadcast
+  needed, and NAT traversal is automatic. It also powers the automatic player list, and
+  it's built into Bazzite. If Tailscale is already up, the choice is remembered and the
+  prompt never appears; if it isn't, you're asked.
+- **Local network / L2 VPN.** For a real LAN, or a Layer-2 VPN such as ZeroTier or
+  Hamachi. Rocket League's own LAN discovery already works there, so the discovery relay
+  is hidden and you add peers by IP. L2 VPNs need more setup and their broadcast/multicast
+  can be inconsistent (MTU quirks, partial support); Hamachi is proprietary, caps free
+  networks at 5 peers and is effectively unmaintained. That's why Tailscale is the
+  recommendation.
+
+Switch anytime in the web UI's **Connection** panel (or `rpmap network [tailscale|lan]`).
+The mode only changes how peers are found and which addresses are accepted — map swapping
+is identical either way. The server listens on all interfaces and **gates every request**:
+Tailscale mode accepts only your tailnet (plus loopback), local-network mode accepts only
+private/LAN addresses. Each call still needs the shared session code or the UI token.
+
 ## Usage
 
 Everything you run — the visual interface, the full command reference, peer sync,
@@ -91,9 +115,11 @@ serving rpmap.
 
 ## Peer sync over Tailscale (Phase 2)
 
-Each machine runs its own `rpmap` server bound to its tailnet IP and shares a session code.
+Each machine runs its own `rpmap` server (listening on all interfaces, gated to the
+tailnet in Tailscale mode — no `--host` needed) and shares a session code.
 The **Players** panel then shows who's online and what each has loaded (compared by `sha256`),
-with **Switch me** / **Set theirs** / **Load mine on everyone** actions. Syncs are **explicit**
+with **Switch me** / **Set theirs** / **Load mine on everyone** actions. In local-network mode
+the roster is your manually-added peers instead of the tailnet. Syncs are **explicit**
 and reference-only — no map bytes move; anything obtained outside the Steam Workshop syncs
 only if the peer already has the byte-identical file. Never swap during an online match.
 
@@ -106,7 +132,8 @@ only if the peer already has the byte-identical file. Never swap during an onlin
 ## Native LAN discovery over Tailscale
 
 Rocket League's **Create LAN / Join LAN** list is driven by a broadcast that a normal VPN hides.
-`rpmap` can relay that discovery across the tailnet:
+`rpmap` can relay that discovery across the tailnet (this is **only needed for Tailscale** — a
+real LAN or an L2 VPN carries the broadcast itself):
 
 ```bash
 # on the machine hosting the LAN match

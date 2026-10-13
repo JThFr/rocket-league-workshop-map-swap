@@ -17,7 +17,7 @@ Two independent jobs:
 
 Usage:
   python3 rpmap.py                      # status window + visual interface (web UI)
-  python3 rpmap.py serve [--host H --port P] [--no-browser] [--no-window] [--secret CODE]
+  python3 rpmap.py serve [--host H --port P] [--network tailscale|lan] [--secret CODE] [--no-window]
   python3 rpmap.py list                 # candidate maps (workshop/mods/~/maps)
   python3 rpmap.py current [--slot s]   # what is loaded in the slot
   python3 rpmap.py use <name|path>      # swap a map into the slot (backs up first)
@@ -29,8 +29,9 @@ Usage:
   python3 rpmap.py session [--new]      # show or rotate the shared session code
   python3 rpmap.py join <code>          # save a session code shared by a peer
   python3 rpmap.py name <display>       # set the name peers see
+  python3 rpmap.py network [tailscale|lan] # show or set the peer connection mode
   python3 rpmap.py stop                 # stop a running UI (or use its Quit button)
-  python3 rpmap.py doctor               # diagnose paths, peers, Tailscale, TLS
+  python3 rpmap.py doctor               # diagnose paths, connection mode, peers, TLS
   python3 rpmap.py lan-host [--peer IP]... # relay native LAN discovery (you host)
   python3 rpmap.py lan-join --host IP   # receive relayed LAN discovery (you join)
   python3 rpmap.py version              # print the version
@@ -54,9 +55,9 @@ from pathlib import Path
 
 import rpmap_doctor
 import rpmap_lan
-from rpmap_config import (APP_VERSION, PRODUCT, SLOTS, SLOT_INFO,
-                          DEFAULT_SLOT, config_path, load_config, new_secret,
-                          save_config)
+from rpmap_config import (APP_VERSION, NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO,
+                          DEFAULT_SLOT, config_path, load_config, network_mode,
+                          new_secret, save_config)
 from rpmap_maps import (detect_cooked, fetch_host_map, host_status, install_map,
                         list_maps, resolve_map, restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity
@@ -114,10 +115,13 @@ def main(argv: list[str] | None = None) -> int:
     p_fe.add_argument("host")
     p_fe.add_argument("port", nargs="?", type=int, default=7777)
     p_srv = sub.add_parser("serve", help="run the visual interface")
-    p_srv.add_argument("--host", default="127.0.0.1")
+    p_srv.add_argument("--host", default=None,
+                       help="address to bind (default: all interfaces; requests are gated)")
     p_srv.add_argument("--port", type=int, default=8787)
     p_srv.add_argument("--no-browser", action="store_true")
     p_srv.add_argument("--secret", help="session code shared with peers")
+    p_srv.add_argument("--network", choices=sorted(NETWORK_MODES),
+                       help="peer connection mode: tailscale (default) or lan")
     p_srv.add_argument("--dev", action="store_true",
                        help="also accept private-LAN peers (testing without Tailscale)")
     p_srv.add_argument("--restore-on-exit", dest="restore_on_exit_serve", action="store_true",
@@ -131,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
     p_jn.add_argument("code")
     p_nm = sub.add_parser("name", help="set the display name peers see")
     p_nm.add_argument("value")
+    p_net = sub.add_parser("network", help="show or set the connection mode")
+    p_net.add_argument("value", nargs="?", choices=sorted(NETWORK_MODES),
+                       help="tailscale (default) or lan; omit to print the current mode")
     sub.add_parser("stop", help="stop a running rpmap UI")
     sub.add_parser("doctor", help="diagnose the environment (paths, peers, Tailscale, TLS)")
 
@@ -184,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
         cfg["display_name"] = args.value.strip() or None
         save_config(cfg)
         print("display name:", cfg.get("display_name") or "(unset)")
+        return 0
+
+    if args.cmd == "network":
+        cfg = load_config()
+        if args.value:
+            cfg["network_mode"] = args.value
+            save_config(cfg)
+        print("network mode:", network_mode(cfg))
         return 0
 
     if args.cmd == "stop":
@@ -246,11 +261,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd in (None, "serve"):
         return run_server(cooked, args.slot,
-                          getattr(args, "host", "127.0.0.1"),
+                          getattr(args, "host", None),
                           getattr(args, "port", 8787),
                           not getattr(args, "no_browser", False),
                           secret=getattr(args, "secret", None),
                           dev=getattr(args, "dev", False),
+                          network=getattr(args, "network", None),
                           restore_on_exit=(getattr(args, "restore_on_exit_serve", False)
                                            or getattr(args, "restore_on_exit", False)),
                           window=(not getattr(args, "no_window_serve", False)

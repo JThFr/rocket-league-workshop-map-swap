@@ -15,8 +15,8 @@ import os
 import sys
 from pathlib import Path
 
-from rpmap_config import (APP_VERSION, PRODUCT, SLOT_INFO, config_path,
-                          load_config)
+from rpmap_config import (APP_VERSION, MODE_LAN, PRODUCT, SLOT_INFO, config_path,
+                          load_config, network_mode)
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -89,18 +89,27 @@ def run(cooked_arg: str | None, slot: str) -> int:
     except Exception as e:
         checks.append(("warn", f"UI: {e}"))
 
-    # --- identity / Tailscale -------------------------------------------- #
+    # --- identity / connection mode -------------------------------------- #
+    mode = network_mode(cfg)
     try:
         ident = peers.local_identity(cfg)
-        ts = peers.tailscale_self()
-        if ts.get("ips"):
-            checks.append(("ok", f"Tailscale: {ident['name']} ({ts['ips'][0]})"))
+        if mode == MODE_LAN:
+            ip = (ident.get("ips") or [None])[0]
+            if ip:
+                checks.append(("ok", f"network: local network ({ip})"))
+            else:
+                checks.append(("warn", "network: local network, no LAN address found",
+                               "check this machine's network connection"))
         else:
-            checks.append(("warn", "Tailscale: no tailnet address",
-                           "is tailscaled up and logged in? `sudo tailscale up`"))
+            ts = peers.tailscale_self()
+            if ts.get("ips"):
+                checks.append(("ok", f"network: Tailscale ({ident['name']}) {ts['ips'][0]}"))
+            else:
+                checks.append(("warn", "network: Tailscale selected, no tailnet address",
+                               "is tailscaled up and logged in? `sudo tailscale up`"))
     except Exception as e:
-        ident, ts = {}, {}
-        checks.append(("warn", f"Tailscale: {e}"))
+        ident = {}
+        checks.append(("warn", f"network: {e}"))
 
     # --- session code ----------------------------------------------------- #
     if cfg.get("session_secret"):
@@ -140,14 +149,18 @@ def run(cooked_arg: str | None, slot: str) -> int:
         data = peers.gather_peers(cooked, slot, cfg, ident or {})
         roster = data.get("peers") or []
         reachable = sum(1 for p in roster if p.get("rpmap"))
+        where = "on your network" if mode == MODE_LAN else "on the tailnet"
         if not roster:
-            checks.append(("info", "peers: none on the tailnet"))
+            fix = ("add peers by IP in the UI" if mode == MODE_LAN
+                   else "bring a peer online on the tailnet")
+            checks.append(("info", f"peers: none {where}", fix))
         else:
+            fix = ("" if reachable else "start rpmap there (same session code)"
+                   if mode == MODE_LAN else
+                   "start rpmap there with `serve --host <tailscale-ip>`")
             checks.append(("ok" if reachable else "warn",
-                           f"peers: {len(roster)} on the tailnet, "
-                           f"{reachable} serving rpmap",
-                           "" if reachable else
-                           "start rpmap there with `serve --host <tailscale-ip>`"))
+                           f"peers: {len(roster)} {where}, {reachable} serving rpmap",
+                           fix))
     except Exception as e:
         checks.append(("warn", f"peers: {e}"))
 

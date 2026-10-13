@@ -40,10 +40,11 @@ stop it without a terminal. This matters after a **self-update**, when the app r
 | `python3 rpmap.py status <host> [port]` | ask a Rocket Plugin host what map it serves |
 | `python3 rpmap.py fetch <host> [port]` | download the host's map and stage it |
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
-| `python3 rpmap.py serve [--host H --port P] [--restore-on-exit]` | run the web UI / peer server |
+| `python3 rpmap.py serve [--host H --port P] [--network tailscale\|lan] [--restore-on-exit]` | run the web UI / peer server |
 | `python3 rpmap.py lan-host [--peer IP]...` | relay native LAN discovery (you host the LAN match) |
 | `python3 rpmap.py lan-join --host IP` | receive relayed native LAN discovery (you join) |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
+| `python3 rpmap.py network [tailscale\|lan]` | show or set the peer connection mode |
 | `python3 rpmap.py stop` | stop a running web UI (same as its Quit button) |
 | `python3 rpmap.py doctor` | diagnose the setup (game path, slot, Tailscale, peers, TLS, window) |
 | `python3 rpmap.py version` | print the version |
@@ -81,14 +82,32 @@ the running one instead of starting a second server.
 Every map gets a preview: the map's own image when it ships one, otherwise fetched once from
 Steam's public workshop API and cached.
 
+## Connection modes
+
+rpmap reaches peers one of two ways; the **Connection** panel in the web UI (or
+`python3 rpmap.py network [tailscale|lan]`) switches between them. **Tailscale is the
+recommended default** and the mode the project is validated on.
+
+- **Tailscale.** Discovers the tailnet roster automatically and gates the peer API to
+  `100.64.0.0/10`. If Tailscale is up, rpmap remembers this and never asks again; if it
+  isn't, the first launch prompts for a choice.
+- **Local network / L2 VPN** (a real LAN, ZeroTier, Hamachi). No tailnet: peers are the
+  ones you add by IP in the **Players** panel, and the API accepts private/LAN addresses.
+  Rocket League's own LAN discovery already works here, so the relay below is hidden.
+
+Either way the server listens on all interfaces (`--host` overrides) and gates each
+request by source address, plus the session code / UI token. The mode changes only how
+peers are found and which addresses are accepted — swapping maps is identical.
+
 ## Peer sync over Tailscale
 
-Each machine runs its own `rpmap` server bound to its tailnet IP; a shared session code
-authorises the API calls.
+Each machine runs its own `rpmap` server (it listens on all interfaces; you no longer need
+to bind it to the tailnet IP yourself) and shares a session code, which authorises the API
+calls.
 
 ```bash
-# on each machine (bind to your tailnet IP, not 0.0.0.0)
-python3 rpmap.py serve --host "$(tailscale ip -4)"
+# on each machine
+python3 rpmap.py
 # it prints a session code — share it; others paste it into the UI's "Join" box
 #   (or: python3 rpmap.py join <code>  /  python3 rpmap.py name "Julien")
 python3 rpmap.py peers      # text roster: who's online, what they've loaded, in-sync
@@ -121,7 +140,8 @@ list* (an older build). "In sync" counts only the reachable rpmap peers.
 Rocket League's **Create LAN / Join LAN** list uses a broadcast the game sends to
 `255.255.255.255:14001`, which never leaves the local network — so tailnet peers don't see each
 other's lobbies. `rpmap` can **relay** that discovery between tailnet peers, giving you the
-in-game lobby browser without BakkesMod/Rocket Plugin:
+in-game lobby browser without BakkesMod/Rocket Plugin. The relay is **only for Tailscale** —
+a real LAN or an L2 VPN carries the broadcast itself, so it's hidden in local-network mode:
 
 ```bash
 # on the machine hosting the LAN match
@@ -153,14 +173,14 @@ The panel shows whether it's relaying, and quitting rpmap stops it.
 
 `python3 rpmap.py doctor` prints a one-shot report of the usual suspects — where Rocket League
 was found, the slot's state and whether a stock backup exists, whether the UI is running, the
-Tailscale address, the session code, the TLS trust store (self-update), whether the status window
-can show, and how many tailnet peers are actually serving rpmap:
+connection mode and address, the session code, the TLS trust store (self-update), whether the
+status window can show, and how many peers are actually serving rpmap:
 
 ```
 rpmap doctor
   [ok] Rocket League: /…/TAGame/CookedPCConsole
   [ok] slot: Utopia Retro: stock map [stock]
-  [ok] Tailscale: Julien (100.108.219.85)
+  [ok] network: Tailscale (Julien) 100.108.219.85
   [!!] peers: 1 on the tailnet, 0 serving rpmap
          -> start rpmap there with `serve --host <tailscale-ip>`
 ```
@@ -173,6 +193,8 @@ Exit code is non-zero only when a hard check fails (e.g. Rocket League not found
 - `RL_MAPS` — extra folder of `.udk`/`.upk` maps (default `~/maps`).
 - Per-user config lives in `%APPDATA%\rpmap\config.json` (Windows) or
   `~/.config/rpmap/config.json` (Linux); preview cache in the matching local cache dir.
+  It holds `network_mode` (`tailscale` or `lan`), the `session_secret`, the display
+  `name`, and any `manual_peers` (used in local-network mode).
 - While the UI is running it also writes `runtime.json` next to the config (mode `0600`, removed
   on a clean exit) so `rpmap stop` and a second launch can find the live server. It holds this
   run's UI token, which is regenerated every time the server starts.

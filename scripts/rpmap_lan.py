@@ -40,7 +40,7 @@ import threading
 import time
 
 from rpmap_config import TAILNET
-from rpmap_peers import tailscale_peers, tailscale_self
+from rpmap_peers import known_peers, tailscale_self
 
 LAN_PORT = 14001             # RL's LAN discovery (broadcast)
 DEFAULT_RELAY_PORT = 14002   # the relay's unicast channel over the tailnet
@@ -208,10 +208,10 @@ def local_advertise() -> str | None:
 
 
 def resolve_peers(cfg: dict, explicit: list[str] | None) -> list[str]:
-    """The relay targets: the explicit ``--peer`` list, else online tailnet peers."""
+    """The relay targets: the explicit ``--peer`` list, else online roster peers."""
     if explicit:
         return [p.strip() for p in explicit if p and p.strip()]
-    return [p["ip"] for p in tailscale_peers(cfg)
+    return [p["ip"] for p in known_peers(cfg)
             if p.get("online") and p.get("ip")]
 
 

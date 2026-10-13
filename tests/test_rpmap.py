@@ -8,6 +8,7 @@ Runs with the standard library only:
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import os
 import stat
@@ -328,15 +329,15 @@ class LanRelayTests(unittest.TestCase):
     def test_resolve_peers_prefers_explicit(self):
         self.assertEqual(lan.resolve_peers({}, ["100.0.0.2", " "]), ["100.0.0.2"])
 
-    def test_resolve_peers_falls_back_to_online_tailnet_peers(self):
-        orig = lan.tailscale_peers
-        lan.tailscale_peers = lambda cfg=None: [
+    def test_resolve_peers_falls_back_to_online_roster_peers(self):
+        orig = lan.known_peers
+        lan.known_peers = lambda cfg=None: [
             {"name": "up", "ip": "100.0.0.2", "online": True},
             {"name": "down", "ip": "100.0.0.3", "online": False}]
         try:
             self.assertEqual(lan.resolve_peers({}, []), ["100.0.0.2"])
         finally:
-            lan.tailscale_peers = orig
+            lan.known_peers = orig
 
     def test_dedupe_drops_exact_repeats(self):
         seen = lan._Seen()
@@ -737,6 +738,54 @@ class HttpTests(_CookedFixture):
         _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
         self.assertFalse(json.loads(body)["running"])
 
+    def test_network_endpoint_reports_the_mode(self):
+        status, body = self._req("GET", "/api/network?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "tailscale")     # default
+        self.assertIn("needs_onboarding", data)
+
+    def test_network_set_is_local_and_persists(self):
+        status, body = self._req("POST", "/api/network?token=" + self.TOKEN,
+                                 body={"mode": "lan"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(self.engine["network_mode"], "lan")
+        self.assertEqual(config.network_mode(config.load_config()), "lan")
+
+    def test_network_set_rejects_a_bad_mode(self):
+        _, body = self._req("POST", "/api/network?token=" + self.TOKEN,
+                            body={"mode": "warp"})
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_manual_peer_add_update_and_remove(self):
+        _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,
+                            body={"ip": "192.168.1.20", "name": "bud"})
+        self.assertTrue(json.loads(body)["ok"])
+        _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,
+                            body={"ip": "192.168.1.20", "name": "buddy"})
+        self.assertEqual(json.loads(body)["manual_peers"][0]["name"], "buddy")
+        _, body = self._req("GET", "/api/peers?token=" + self.TOKEN)
+        self.assertEqual(json.loads(body)["manual_peers"][0]["ip"], "192.168.1.20")
+        _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,
+                            body={"ip": "192.168.1.20", "remove": True})
+        self.assertEqual(json.loads(body)["manual_peers"], [])
+
+    def test_manual_peer_requires_a_valid_ip(self):
+        _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,
+                            body={"ip": "not-an-ip"})
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_lan_relay_is_refused_in_local_network_mode(self):
+        self.engine["network_mode"] = "lan"
+        _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                            body={"mode": "host"})
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("local-network", data["error"])
+        _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertFalse(json.loads(body)["available"])
+
 
 class EveryoneFilterTests(unittest.TestCase):
     """Two servers with different inventories; one sees the other as a peer."""
@@ -863,6 +912,139 @@ class QuitGateTests(unittest.TestCase):
         handler = self._handler(ident={"peer_id": "me", "name": "me",
                                        "ips": ["100.64.0.7"], "dns": ""})
         self.assertFalse(handler._local_ok(_Conn()))
+
+
+class NetworkModeTests(unittest.TestCase):
+    """The Tailscale vs. local-network choice: defaults, gates and discovery."""
+
+    @staticmethod
+    def _conn(ip):
+        class _Conn:
+            client_address = (ip, 51234)
+        return _Conn()
+
+    def _handler(self, mode):
+        return web.make_handler({"cooked": Path("."), "slot": "underpass",
+                                 "token": "t", "host": "0.0.0.0", "secret": "s",
+                                 "cfg": {}, "ident": {}, "dev": False,
+                                 "port": 0, "network_mode": mode})
+
+    def test_unset_mode_defaults_to_tailscale(self):
+        self.assertEqual(config.network_mode({}), "tailscale")
+        self.assertIsNone(config.network_mode_setting({}))
+        self.assertEqual(config.network_mode({"network_mode": "lan"}), "lan")
+        # an unknown value is ignored, not trusted
+        self.assertEqual(config.network_mode({"network_mode": "warp"}), "tailscale")
+        self.assertIsNone(config.network_mode_setting({"network_mode": "warp"}))
+
+    def test_needs_onboarding_only_without_tailscale(self):
+        orig_self, orig_inst = web.tailscale_self, web.tailscale_installed
+        engine = {"cfg": {}, "network_mode": "tailscale", "ident": {}}
+        try:
+            # No Tailscale at all, never chosen -> ask.
+            web.tailscale_installed = lambda: False
+            web.tailscale_self = lambda: {"ips": []}
+            st = web._network_status(engine)
+            self.assertFalse(st["configured"])
+            self.assertTrue(st["needs_onboarding"])
+
+            # Installed (even if momentarily down): a Tailscale user is not nagged.
+            web.tailscale_installed = lambda: True
+            st = web._network_status(engine)
+            self.assertFalse(st["needs_onboarding"])
+            self.assertFalse(st["tailscale_available"])
+
+            web.tailscale_self = lambda: {"ips": ["100.0.0.5"]}
+            self.assertTrue(web._network_status(engine)["tailscale_available"])
+
+            # Already chosen -> never ask.
+            web.tailscale_installed = lambda: False
+            web.tailscale_self = lambda: {"ips": []}
+            engine["cfg"] = {"network_mode": "tailscale"}
+            self.assertFalse(web._network_status(engine)["needs_onboarding"])
+        finally:
+            web.tailscale_self, web.tailscale_installed = orig_self, orig_inst
+
+    def test_host_gate_accepts_own_literal_addresses(self):
+        class _H:
+            def __init__(self, host):
+                self.headers = {"Host": host}
+
+        ts = self._handler("tailscale")
+        self.assertTrue(ts._host_ok(_H("100.64.0.7")))
+        self.assertTrue(ts._host_ok(_H("127.0.0.1")))
+        self.assertFalse(ts._host_ok(_H("8.8.8.8")))
+        self.assertFalse(ts._host_ok(_H("evil.example")))
+
+        lan = self._handler("lan")
+        self.assertTrue(lan._host_ok(_H("192.168.1.5")))
+        self.assertFalse(lan._host_ok(_H("8.8.8.8")))
+        self.assertFalse(lan._host_ok(_H("evil.example")))
+
+    def test_source_gate_by_mode(self):
+        tailscale = self._handler("tailscale")
+        self.assertTrue(tailscale._source_ok(self._conn("127.0.0.1")))
+        self.assertTrue(tailscale._source_ok(self._conn("100.108.219.85")))
+        self.assertFalse(tailscale._source_ok(self._conn("192.168.1.5")))
+        self.assertFalse(tailscale._source_ok(self._conn("8.8.8.8")))
+
+        lan = self._handler("lan")
+        self.assertTrue(lan._source_ok(self._conn("127.0.0.1")))
+        self.assertTrue(lan._source_ok(self._conn("192.168.1.5")))
+        self.assertFalse(lan._source_ok(self._conn("8.8.8.8")))
+        self.assertFalse(lan._source_ok(self._conn("100.108.219.85")))  # tailnet, not LAN
+
+    def test_known_peers_is_manual_only_in_lan_mode(self):
+        cfg = {"network_mode": "lan",
+               "manual_peers": [{"ip": "192.168.1.9", "name": "bud"}]}
+        calls = {"n": 0}
+
+        def fake_status():
+            calls["n"] += 1
+            return {"Peer": {"k": {"HostName": "pal", "TailscaleIPs": ["100.0.0.2"],
+                                   "Online": True}}}
+
+        orig = peers._tailscale_status
+        peers._tailscale_status = fake_status
+        try:
+            got = peers.known_peers(cfg)
+        finally:
+            peers._tailscale_status = orig
+        self.assertEqual(calls["n"], 0, "LAN mode must not call tailscale")
+        self.assertEqual([(p["name"], p["ip"], p["manual"]) for p in got],
+                         [("bud", "192.168.1.9", True)])
+
+    def test_known_peers_keeps_the_tailnet_in_tailscale_mode(self):
+        orig = peers._tailscale_status
+        peers._tailscale_status = lambda: {
+            "Peer": {"k": {"HostName": "pal", "TailscaleIPs": ["100.0.0.2"], "Online": True}}}
+        try:
+            got = peers.known_peers({"network_mode": "tailscale"})
+        finally:
+            peers._tailscale_status = orig
+        self.assertEqual([(p["name"], p["ip"]) for p in got], [("pal", "100.0.0.2")])
+
+    def test_local_identity_lan_mode_skips_tailscale(self):
+        called = {"n": 0}
+
+        def fake_ts():
+            called["n"] += 1
+            return {"ips": ["100.0.0.9"]}
+
+        orig_ts, orig_ip = peers.tailscale_self, peers.local_ipv4s
+        peers.tailscale_self = fake_ts
+        peers.local_ipv4s = lambda: ["192.168.1.5"]
+        try:
+            ident = peers.local_identity({"network_mode": "lan"})
+        finally:
+            peers.tailscale_self, peers.local_ipv4s = orig_ts, orig_ip
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(ident["ips"], ["192.168.1.5"])
+        self.assertEqual(ident["dns"], "")
+
+    def test_local_ipv4s_finds_a_private_address_or_none(self):
+        for ip in peers.local_ipv4s():
+            self.assertEqual(ipaddress.ip_address(ip).version, 4)
 
 
 class RuntimeFileTests(unittest.TestCase):

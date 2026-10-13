@@ -54,7 +54,8 @@ def run(*, version: str, status_fn, on_open, on_restore, on_quit,
         quit_event) -> None:
     """Show the status window until it is asked to quit. Blocks (Tk mainloop).
 
-    ``status_fn`` returns ``(arena, what)`` for the current slot; ``on_quit``
+    ``status_fn`` returns ``(arena, what[, where])`` for the current slot, where
+    the optional ``where`` names the connection mode shown as a hint; ``on_quit``
     must stop the server *and* set ``quit_event``. ``on_open``/``on_restore``
     are the button actions.
     """
@@ -85,9 +86,12 @@ def run(*, version: str, status_fn, on_open, on_restore, on_quit,
 
     def refresh():
         try:
-            arena, what = status_fn()
+            res = status_fn()
+            arena, what = res[0], res[1]
+            where = res[2] if len(res) > 2 else None
             status.config(text=f"{arena}  \u2014  {what}")
-            hint.config(text=f'In game: Free Play \u2192 arena "{arena}".')
+            prefix = f"Connection: {where}.  " if where else ""
+            hint.config(text=f'{prefix}In game: Free Play \u2192 arena "{arena}".')
         except Exception:
             status.config(text="(could not read the slot)")
             hint.config(text="")
