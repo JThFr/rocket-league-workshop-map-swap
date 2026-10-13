@@ -31,6 +31,8 @@ Usage:
   python3 rpmap.py name <display>       # set the name peers see
   python3 rpmap.py stop                 # stop a running UI (or use its Quit button)
   python3 rpmap.py doctor               # diagnose paths, peers, Tailscale, TLS
+  python3 rpmap.py lan-host [--peer IP]... # relay native LAN discovery (you host)
+  python3 rpmap.py lan-join --host IP   # receive relayed LAN discovery (you join)
   python3 rpmap.py version              # print the version
   python3 rpmap.py check-update         # check GitHub for a newer release
 
@@ -51,6 +53,7 @@ import sys
 from pathlib import Path
 
 import rpmap_doctor
+import rpmap_lan
 from rpmap_config import (APP_VERSION, PRODUCT, SLOTS, SLOT_INFO,
                           DEFAULT_SLOT, config_path, load_config, new_secret,
                           save_config)
@@ -130,6 +133,30 @@ def main(argv: list[str] | None = None) -> int:
     p_nm.add_argument("value")
     sub.add_parser("stop", help="stop a running rpmap UI")
     sub.add_parser("doctor", help="diagnose the environment (paths, peers, Tailscale, TLS)")
+
+    def _add_lan_args(p):
+        p.add_argument("--token", help="shared secret (default: the shared session code)")
+        p.add_argument("--relay-port", type=int, default=rpmap_lan.DEFAULT_RELAY_PORT,
+                       help="relay UDP port (default %(default)s)")
+        p.add_argument("--bind", help="relay socket address (default: your tailnet IP)")
+        p.add_argument("--inject", choices=("broadcast", "loopback"), default="broadcast",
+                       help="how to replay a message into RL (default %(default)s)")
+        p.add_argument("--lan-port", type=int, default=rpmap_lan.LAN_PORT,
+                       help="RL's LAN discovery port (default %(default)s)")
+        p.add_argument("--dev", action="store_true",
+                       help="also accept private-LAN relay senders (testing)")
+
+    p_lh = sub.add_parser("lan-host", help="relay native LAN discovery to tailnet peers")
+    p_lh.add_argument("--peer", action="append", default=[],
+                      help="tailnet IP of a joiner (repeatable; default: all online peers)")
+    p_lh.add_argument("--advertise",
+                      help="IP written into ServerID (default: your tailscale IP)")
+    _add_lan_args(p_lh)
+
+    p_lj = sub.add_parser("lan-join", help="receive relayed native LAN discovery")
+    p_lj.add_argument("--host", required=True, help="tailnet IP of the host")
+    _add_lan_args(p_lj)
+
     sub.add_parser("version", help="print the version")
     sub.add_parser("check-update", help="check GitHub for a newer release")
 
@@ -168,6 +195,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "doctor":
         return rpmap_doctor.run(args.cooked, args.slot)
+
+    if args.cmd in ("lan-host", "lan-join"):
+        cfg = load_config()
+        token = (args.token or "").strip() or cfg.get("session_secret") or ""
+        if not token:
+            print("no shared secret: pass --token or set the session code "
+                  "(`rpmap session --new`)", file=sys.stderr)
+            return 1
+        if args.cmd == "lan-host":
+            return rpmap_lan.run_host(
+                peers=rpmap_lan.resolve_peers(cfg, args.peer), token=token,
+                advertise=args.advertise, relay_port=args.relay_port,
+                bind=args.bind, inject_mode=args.inject, lan_port=args.lan_port,
+                dev=args.dev)
+        return rpmap_lan.run_join(
+            host=args.host, token=token, relay_port=args.relay_port,
+            bind=args.bind, inject_mode=args.inject, lan_port=args.lan_port,
+            dev=args.dev)
 
     if args.cmd == "version":
         print(f"{PRODUCT} {APP_VERSION}")

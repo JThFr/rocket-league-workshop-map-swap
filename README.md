@@ -34,6 +34,12 @@ in the way, and this tool exists to smooth them out:
 3. **Peer sync (reference-only).** Peers on a Tailscale tailnet see what map each other has
    loaded (compared by `sha256`) and can push/pull a switch. No map bytes are transferred —
    each peer loads the map from its own copy.
+4. **Native LAN discovery (relay).** Rocket League's built-in **Create LAN / Join LAN** list
+   normally can't cross the internet, because the discovery broadcast never leaves the local
+   network. `rpmap lan-host` / `lan-join` relay that discovery between tailnet peers, so the
+   in-game lobby list works — no BakkesMod or Rocket Plugin needed just to *find* the host (you
+   can also start/stop the relay from the web UI). The match itself still connects directly over
+   Tailscale.
 
 ## Get it
 
@@ -96,3 +102,20 @@ only if the peer already has the byte-identical file. Never swap during an onlin
 - [docs/usage.md](docs/usage.md) — running it, commands, peer sync, configuration, updates, building
 - [docs/rpmap-phase2.md](docs/rpmap-phase2.md) — peer-sync design
 - [maps/README.md](maps/README.md) — where to put map files
+
+## Native LAN discovery over Tailscale
+
+Rocket League's **Create LAN / Join LAN** list is driven by a broadcast that a normal VPN hides.
+`rpmap` can relay that discovery across the tailnet:
+
+```bash
+# on the machine hosting the LAN match
+python3 rpmap.py lan-host
+# on each joiner
+python3 rpmap.py lan-join --host <host-tailnet-ip>
+```
+
+Both sides use the shared **session code** (the relay token defaults to it). On the joiner, open
+the game's **Join LAN / local lobby** list — the host's lobby appears and connects straight to the
+host's `100.x:7777`. The relay carries **only discovery**; the match itself runs over Tailscale.
+Validated in-game between a Linux host and a Windows peer.

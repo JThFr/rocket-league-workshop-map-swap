@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import rpmap_config as config
 import rpmap_doctor as doctor
+import rpmap_lan as lan
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -38,6 +39,39 @@ PACKAGE_TAG = 0x9E2A83C1
 def _package(licensee: int) -> bytes:
     """Minimal bytes that look like a cooked UE3 package header."""
     return struct.pack("<IHH", PACKAGE_TAG, 868, licensee) + b"\x00" * 32
+
+
+def _lan_msg(class_name: str, payload: bytes) -> bytes:
+    """A synthetic 14001 datagram: [uint32 BE name length][name][0x00][JSON]."""
+    name = class_name.encode()
+    return struct.pack(">I", len(name)) + name + b"\x00" + payload
+
+
+class _FakeRelay:
+    """Stand-in for rpmap_lan.Relay so UI tests never bind the game ports."""
+
+    def __init__(self, **kw):
+        self.mode = kw.get("mode")
+        self.host = kw.get("host")
+        self.peers = kw.get("peers") or []
+        self.relay_port = kw.get("relay_port")
+        self.inject_mode = kw.get("inject_mode")
+        self.error = None
+        self._running = False
+
+    @property
+    def running(self):
+        return self._running
+
+    def start(self):
+        if self._running:
+            return False
+        self._running = True
+        return True
+
+    def stop(self, timeout=3.0):
+        self._running = False
+        return True
 
 
 def setUpModule() -> None:
@@ -231,6 +265,132 @@ class PeerTests(unittest.TestCase):
         self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
 
 
+class LanRelayTests(unittest.TestCase):
+    """The native LAN discovery relay core."""
+
+    QUERY = _lan_msg(
+        "ProjectX.LanMessage_HostQuery_X",
+        b'{"BuildID":-1846618557,"bHost":false,"Nonce":4288142294}')
+    RESPONSE = _lan_msg(
+        "ProjectX.LanMessage_HostResponse_X",
+        b'{"Result":{},"ServerID":"192.168.1.16:7777",'
+        b'"MetaData":"{}","Nonce":4288142294}')
+
+    def test_classify_query_and_response(self):
+        self.assertEqual(lan.classify(self.QUERY)[0], "query")
+        self.assertEqual(lan.classify(self.RESPONSE)[0], "response")
+
+    def test_classify_ignores_other_packets(self):
+        self.assertIsNone(lan.classify(b"")[0])
+        self.assertIsNone(lan.classify(b"\xff\xff\xff\xff\x00")[0])
+        self.assertIsNone(lan.classify(b"\x00\x00\x00\x02hi")[0])
+
+    def test_rewrite_grows_the_json_and_keeps_the_frame(self):
+        new, old, addr = lan.rewrite_serverid(self.RESPONSE, "100.108.219.85")
+        self.assertEqual(old, "192.168.1.16:7777")
+        self.assertEqual(addr, "100.108.219.85:7777")
+        self.assertIn(b'"ServerID":"100.108.219.85:7777"', new)
+        # the class-name length prefix must not move
+        n_old = int.from_bytes(self.RESPONSE[:4], "big")
+        n_new = int.from_bytes(new[:4], "big")
+        self.assertEqual(new[:4 + n_new], self.RESPONSE[:4 + n_old])
+        self.assertGreater(len(new), len(self.RESPONSE))
+        self.assertEqual(lan.classify(new)[0], "response")   # still a response
+
+    def test_rewrite_without_serverid_is_none(self):
+        self.assertIsNone(lan.rewrite_serverid(self.QUERY, "100.108.219.85"))
+
+    def test_rewrite_preserves_the_port(self):
+        msg = _lan_msg("ProjectX.LanMessage_HostResponse_X",
+                       b'{"ServerID":"10.0.0.5:12345"}')
+        self.assertEqual(lan.rewrite_serverid(msg, "100.0.0.1")[2], "100.0.0.1:12345")
+
+    def test_nonce_is_extracted(self):
+        self.assertEqual(lan.extract_nonce(self.RESPONSE), "4288142294")
+
+    def test_relay_framing_roundtrip(self):
+        pkt = lan.encode("s3cr3t", lan.TYPE_Q, self.QUERY)
+        self.assertEqual(lan.decode("s3cr3t", pkt), (lan.TYPE_Q, self.QUERY))
+
+    def test_relay_framing_rejects_bad_token_and_magic(self):
+        self.assertEqual(lan.decode("other", lan.encode("s3cr3t", lan.TYPE_R, b"x")),
+                         (None, None))
+        self.assertEqual(lan.decode("s3cr3t", b"NOPE" + b"s3cr3t\x00R"), (None, None))
+
+    def test_source_gate_is_tailnet_only(self):
+        self.assertTrue(lan.source_allowed("127.0.0.1"))
+        self.assertTrue(lan.source_allowed("100.108.219.85"))
+        self.assertFalse(lan.source_allowed("192.168.1.16"))
+        self.assertFalse(lan.source_allowed("203.0.113.9"))
+        self.assertFalse(lan.source_allowed("not-an-ip"))
+        self.assertTrue(lan.source_allowed("192.168.1.16", dev=True))
+
+    def test_resolve_peers_prefers_explicit(self):
+        self.assertEqual(lan.resolve_peers({}, ["100.0.0.2", " "]), ["100.0.0.2"])
+
+    def test_resolve_peers_falls_back_to_online_tailnet_peers(self):
+        orig = lan.tailscale_peers
+        lan.tailscale_peers = lambda cfg=None: [
+            {"name": "up", "ip": "100.0.0.2", "online": True},
+            {"name": "down", "ip": "100.0.0.3", "online": False}]
+        try:
+            self.assertEqual(lan.resolve_peers({}, []), ["100.0.0.2"])
+        finally:
+            lan.tailscale_peers = orig
+
+    def test_dedupe_drops_exact_repeats(self):
+        seen = lan._Seen()
+        self.assertTrue(seen.fresh(b"abc"))
+        self.assertFalse(seen.fresh(b"abc"))
+        self.assertTrue(seen.fresh(b"def"))
+
+
+class LanRelayControllerTests(unittest.TestCase):
+    """The threaded `Relay` controller (the web UI drives this)."""
+
+    def test_start_and_stop_run_the_loop_off_the_main_thread(self):
+        orig = lan.run_host
+        started = threading.Event()
+
+        def fake_run(*, peers, token, stop_event=None, **kw):
+            started.set()
+            while not stop_event.is_set():
+                time.sleep(0.01)
+            return 0
+
+        lan.run_host = fake_run
+        try:
+            relay = lan.Relay(mode="host", token="t", peers=["100.0.0.2"],
+                              advertise="100.0.0.1")
+            self.assertFalse(relay.running)
+            self.assertTrue(relay.start())
+            self.assertTrue(started.wait(2), "relay loop never started")
+            self.assertTrue(relay.running)
+            self.assertFalse(relay.start(), "a second start must be refused")
+            self.assertTrue(relay.stop())
+            self.assertFalse(relay.running)
+        finally:
+            lan.run_host = orig
+
+    def test_setup_error_is_captured_not_raised(self):
+        orig = lan.run_join
+
+        def boom(**kw):
+            raise SystemExit("no Tailscale IPv4 detected")
+
+        lan.run_join = boom
+        try:
+            relay = lan.Relay(mode="join", token="t", host="100.0.0.2")
+            relay.start()
+            for _ in range(100):
+                if relay.error:
+                    break
+                time.sleep(0.02)
+            self.assertIn("Tailscale", relay.error or "")
+        finally:
+            lan.run_join = orig
+
+
 class SyncTargetTests(_CookedFixture):
     """`sync_action` only contacts peers on the discovered roster.
 
@@ -384,7 +544,7 @@ class HttpTests(_CookedFixture):
     def setUp(self) -> None:
         super().setUp()
         self.quit_called = threading.Event()
-        engine = {
+        self.engine = engine = {
             "cooked": self.cooked, "slot": "underpass", "token": self.TOKEN,
             "host": "127.0.0.1", "secret": "s3cr3t", "cfg": {},
             "ident": {"peer_id": "tester", "name": "tester", "ips": [], "dns": ""},
@@ -522,6 +682,60 @@ class HttpTests(_CookedFixture):
                               "token": self.TOKEN})
         self.assertIsNone(web.running_instance())
         config.clear_runtime(10_000_000)
+
+    def test_lan_status_starts_idle(self):
+        status, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["running"])
+
+    def test_lan_start_requires_a_token(self):
+        self.assertEqual(self._req("POST", "/api/lan/start")[0], 403)
+
+    def test_ui_exposes_the_lan_relay_panel(self):
+        _, body = self._req("GET", "/")
+        self.assertIn(b"LAN discovery relay", body)
+        self.assertIn(b"startLan(", body)
+        self.assertIn(b"stopLan(", body)
+
+    def test_lan_join_needs_a_host(self):
+        status, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                 body={"mode": "join"})
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("host", json.loads(body)["error"])
+
+    def test_lan_host_without_peers_is_refused(self):
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: []
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "host"})
+        finally:
+            lan.resolve_peers = orig
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("peer", json.loads(body)["error"])
+
+    def test_lan_start_and_stop_roundtrip(self):
+        self.engine["relay_factory"] = _FakeRelay
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: ["100.64.0.7"]
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "host"})
+            started = json.loads(body)
+            self.assertTrue(started["ok"], body)
+            self.assertTrue(started["lan"]["running"])
+            self.assertEqual(started["lan"]["mode"], "host")
+        finally:
+            lan.resolve_peers = orig
+
+        _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["running"])
+
+        _, body = self._req("POST", "/api/lan/stop?token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["ok"])
+        _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertFalse(json.loads(body)["running"])
 
 
 class EveryoneFilterTests(unittest.TestCase):
