@@ -15,8 +15,9 @@ import os
 import sys
 from pathlib import Path
 
-from rpmap_config import (APP_VERSION, MODE_LAN, PRODUCT, SLOT_INFO, config_path,
-                          load_config, network_mode)
+from rpmap_config import (APP_VERSION, MODE_LAN, PRODUCT, SLOT_INFO,
+                          auto_update_setting, config_path, load_config,
+                          network_mode)
 import rpmap_maps as maps
 import rpmap_peers as peers
 import rpmap_update as update
@@ -117,6 +118,18 @@ def run(cooked_arg: str | None, slot: str) -> int:
     else:
         checks.append(("warn", "session code not set",
                        "run `rpmap session --new` (or paste a peer's code)"))
+
+    # --- update preference ------------------------------------------------- #
+    setting = auto_update_setting(cfg)
+    if setting == "auto":
+        checks.append(("ok", "updates: install automatically on startup"))
+    elif setting == "check":
+        checks.append(("ok", "updates: check on startup (no auto-install)"))
+    elif setting == "off":
+        checks.append(("info", "updates: manual only"))
+    else:
+        checks.append(("info", "updates: not chosen yet",
+                       "asked on first launch (packaged builds) / in the UI"))
 
     # --- self-update TLS -------------------------------------------------- #
     if os.name == "nt":
