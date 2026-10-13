@@ -42,6 +42,14 @@ PRODUCT = "rpmap"
 DEFAULT_PORT = 8787
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 
+# How peers reach each other. "tailscale" discovers the roster on the tailnet
+# and gates the peer API to it; "lan" skips Tailscale entirely and uses the
+# local network (a real LAN or an L2 VPN like ZeroTier/Hamachi) directly.
+MODE_TAILSCALE = "tailscale"
+MODE_LAN = "lan"
+NETWORK_MODES = (MODE_TAILSCALE, MODE_LAN)
+DEFAULT_NETWORK_MODE = MODE_TAILSCALE
+
 # Where the packaged builds live (used only by the self-updater).
 GITHUB_REPO = "JThFr/rocket-league-workshop-map-swap"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -97,6 +105,24 @@ def save_config(cfg: dict) -> None:
             os.chmod(p, 0o600)
         except OSError:
             pass
+
+
+def network_mode_setting(cfg: dict | None = None) -> str | None:
+    """The network mode explicitly stored in the config, or None if never chosen."""
+    value = (cfg or {}).get("network_mode") if isinstance(cfg, dict) else None
+    value = str(value or "").strip().lower()
+    return value if value in NETWORK_MODES else None
+
+
+def network_mode(cfg: dict | None = None) -> str:
+    """The effective network mode, always a valid value.
+
+    An unset or unknown mode falls back to **Tailscale** - the recommended,
+    already-configured path - so existing installs (and any ambiguity) keep the
+    current behaviour. Use :func:`network_mode_setting` to tell "chosen
+    Tailscale" apart from "never chosen" (the onboarding prompt).
+    """
+    return network_mode_setting(cfg) or DEFAULT_NETWORK_MODE
 
 
 def new_secret() -> str:

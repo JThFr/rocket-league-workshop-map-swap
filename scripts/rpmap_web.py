@@ -22,12 +22,92 @@ from urllib.parse import urlparse, parse_qs, quote
 
 import rpmap_lan
 import rpmap_window
-from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
-                          TAILNET, clear_runtime, load_config, new_secret,
-                          pid_alive, read_runtime, save_config, write_runtime)
+from rpmap_config import (APP_VERSION, DEFAULT_PORT, MODE_LAN, MODE_TAILSCALE,
+                          NETWORK_MODES, PRODUCT, SLOTS, SLOT_INFO, TAILNET,
+                          clear_runtime, load_config, network_mode,
+                          network_mode_setting, new_secret, pid_alive,
+                          read_runtime, save_config, write_runtime)
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
-from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
+from rpmap_peers import (gather_peers, known_peers, local_identity, local_ipv4s,
+                         peer_switch, sync_action, tailscale_installed,
+                         tailscale_self)
+
+
+# --------------------------------------------------------------------------- #
+# Network mode (Tailscale vs. plain local network / L2 VPN)
+# --------------------------------------------------------------------------- #
+
+def _engine_mode(engine: dict) -> str:
+    """The live mode for this run (kept in the engine; falls back to the config)."""
+    return engine.get("network_mode") or network_mode(engine.get("cfg") or {})
+
+
+def _network_status(engine: dict) -> dict:
+    """The connection mode plus enough detection for the UI to explain it.
+
+    ``needs_onboarding`` is deliberately Tailscale-first: a machine with Tailscale
+    installed is never interrupted with the chooser - only someone without it is
+    asked, which is exactly who might need the LAN path.
+    """
+    cfg = engine.get("cfg") or {}
+    setting = network_mode_setting(cfg)
+    mode = _engine_mode(engine)
+    installed = tailscale_installed()
+    ts_ip = None
+    if mode != MODE_LAN and installed:   # no subprocess in LAN mode / when absent
+        ts_ip = (tailscale_self().get("ips") or [None])[0]
+    lan_ips = local_ipv4s()
+    return {
+        "mode": mode,
+        "configured": setting is not None,
+        "modes": list(NETWORK_MODES),
+        "tailscale_installed": installed,
+        "tailscale_available": bool(ts_ip),
+        "tailnet_ip": ts_ip,
+        "lan_ip": lan_ips[0] if lan_ips else None,
+        # Tailscale-first: only a machine with no Tailscale at all is asked.
+        "needs_onboarding": setting is None and not installed,
+    }
+
+
+def _network_set(engine: dict, payload: dict) -> dict:
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in NETWORK_MODES:
+        return {"ok": False, "error": "mode must be 'tailscale' or 'lan'"}
+    cfg = engine.setdefault("cfg", {})
+    cfg["network_mode"] = mode
+    save_config(cfg)
+    engine["network_mode"] = mode
+    engine["ident"] = local_identity(cfg)     # refresh IPs for the new mode
+    return {"ok": True, "network": _network_status(engine)}
+
+
+def _peers_manual_set(engine: dict, payload: dict) -> dict:
+    """Add/update or remove a manual peer (the local-network roster)."""
+    cfg = engine.setdefault("cfg", {})
+    manual = [m for m in (cfg.get("manual_peers") or []) if isinstance(m, dict)]
+    ip = str(payload.get("ip") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    if payload.get("remove"):
+        manual = [m for m in manual if str(m.get("ip") or "").strip() != ip]
+    else:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return {"ok": False, "error": "enter a valid IP address"}
+        existing = next((m for m in manual if str(m.get("ip") or "").strip() == ip), None)
+        if existing is not None:
+            if name:
+                existing["name"] = name
+        else:
+            entry = {"ip": ip}
+            if name:
+                entry["name"] = name
+            manual.append(entry)
+    cfg["manual_peers"] = manual
+    save_config(cfg)
+    return {"ok": True, "manual_peers": manual}
 
 
 # --------------------------------------------------------------------------- #
@@ -36,8 +116,9 @@ from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
 
 def _lan_status(engine: dict) -> dict:
     relay = engine.get("lan")
+    available = _engine_mode(engine) != MODE_LAN
     if not relay:
-        return {"running": False, "error": None}
+        return {"running": False, "error": None, "available": available}
     return {
         "running": bool(relay.running),
         "mode": relay.mode,
@@ -46,6 +127,7 @@ def _lan_status(engine: dict) -> dict:
         "relay_port": relay.relay_port,
         "inject": relay.inject_mode,
         "error": relay.error,
+        "available": available,
     }
 
 
@@ -180,6 +262,22 @@ PAGE = r"""<!doctype html>
   .dot.on{background:var(--accent2)}
   .dot.off{background:var(--red)}
   code.secret{font-size:14px;letter-spacing:.04em}
+
+  /* connection-mode chooser */
+  .modal-back{position:fixed;inset:0;background:#010409cc;display:flex;align-items:center;
+              justify-content:center;z-index:20;padding:20px}
+  .modal{background:var(--bg2);border:1px solid #30363d;border-radius:14px;max-width:640px;width:100%;
+         padding:22px 24px;box-shadow:0 12px 40px #0009;max-height:90vh;overflow:auto}
+  .modal h2{margin:0 0 4px;color:var(--white);font-size:19px}
+  .opt{display:flex;gap:12px;align-items:flex-start;border:1px solid #30363d;border-radius:10px;
+       padding:12px 14px;margin-top:10px;cursor:pointer}
+  .opt:hover{background:var(--bg3)}
+  .opt.on{border-color:var(--accent2);background:#23863622}
+  .opt input{margin-top:3px;flex:0 0 auto}
+  .opt .t{color:var(--white);font-weight:700}
+  .opt .d{color:var(--fg2);font-size:12.5px;margin-top:3px}
+  .rec{font-size:11px;padding:2px 7px;border-radius:6px;background:var(--accent);
+       color:#fff;margin-left:6px;text-transform:uppercase;letter-spacing:.04em}
 </style></head>
 <body>
 <header>
@@ -221,6 +319,16 @@ PAGE = r"""<!doctype html>
 
   <div class="panel">
     <div class="row">
+      <b>Connection</b>
+      <span class="grow"></span>
+      <span class="muted" id="networkStatus">checking...</span>
+      <button onclick="openNetworkModal()">Change</button>
+    </div>
+    <div class="muted" id="networkHint" style="margin-top:6px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
       <b>Players</b>
       <span class="grow"></span>
       <span class="muted" id="peersStatus">loading...</span>
@@ -235,6 +343,12 @@ PAGE = r"""<!doctype html>
       <input class="search" id="joinCode" placeholder="Paste a peer's session code...">
       <button onclick="joinSession()">Join</button>
     </div>
+    <div class="row" id="manualPeerRow" style="margin-top:10px;display:none">
+      <input class="search" id="peerIp" placeholder="Peer IP (e.g. 192.168.1.20)">
+      <input class="search" id="peerName" placeholder="Name (optional)" style="min-width:150px">
+      <button onclick="addManualPeer()">Add peer</button>
+      <span class="muted">Machines on your LAN / L2 VPN running rpmap.</span>
+    </div>
     <table class="peers" id="peerTable" style="margin-top:10px"></table>
     <div class="muted" id="peersEmpty" style="margin-top:6px;display:none">
       No peers discovered. Start tailscaled, run both machines on the tailnet with the
@@ -242,7 +356,7 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="lanPanel">
     <div class="row">
       <b>LAN discovery relay</b>
       <span class="grow"></span>
@@ -264,12 +378,50 @@ PAGE = r"""<!doctype html>
   </div>
 </main>
 <div class="toast" id="toast"></div>
+
+<div class="modal-back" id="netModal" style="display:none">
+  <div class="modal">
+    <h2>How are you connecting to the other players?</h2>
+    <p class="muted" style="margin:6px 0 0">
+      rpmap can reach your friends over <b>Tailscale</b> or straight over your own network.
+      It only affects how peers are found and which addresses are accepted &mdash; swapping maps
+      works the same either way. You can change this later in <b>Connection</b>.
+    </p>
+    <label class="opt" id="optTs" onclick="pickMode('tailscale')">
+      <input type="radio" name="netMode" value="tailscale">
+      <span>
+        <span class="t">Tailscale<span class="rec">recommended</span></span>
+        <span class="d">A Layer-3 mesh VPN. Rocket League joins by IP:port, so Tailscale's
+          stable <code>100.x</code> address works directly &mdash; no LAN broadcast needed, and NAT
+          traversal is automatic. It also powers the automatic player list. Already built into
+          Bazzite, and the setup this tool is tested against.</span>
+      </span>
+    </label>
+    <label class="opt" id="optLan" onclick="pickMode('lan')">
+      <input type="radio" name="netMode" value="lan">
+      <span>
+        <span class="t">Local network / L2 VPN</span>
+        <span class="d">For an actual LAN, or an L2 VPN such as ZeroTier or Hamachi. These
+          emulate a Layer-2 network, so they need more setup and their broadcast/multicast can be
+          inconsistent (MTU quirks, partial support) &mdash; and Hamachi is proprietary, caps free
+          networks at 5 peers and is effectively unmaintained. Here the game's own LAN discovery
+          is used directly, so the discovery relay isn't needed; you add peers by IP.</span>
+      </span>
+    </label>
+    <div class="muted" id="netModalDetect" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:14px">
+      <button onclick="closeNetworkModal(true)">Continue with Tailscale</button>
+      <button class="primary" onclick="saveNetworkMode()">Save</button>
+    </div>
+  </div>
+</div>
 <script>
 let STATE = null;
 let TIMERS = [];        // poll intervals, cleared when the user quits
 let COMMON = null;      // map keys that every reachable peer has, or null
 let ARENA = 'the arena';
 let ARENA_NOTE = '';
+let NETWORK = null;     // {mode, tailscale_available, tailnet_ip, lan_ip, ...}
 const token = new URLSearchParams(location.search).get('token') || '';
 const api = (p, opts={}) => fetch(p + (p.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token), opts);
 const prevUrl = id => '/api/preview?id=' + encodeURIComponent(id) + '&token=' + encodeURIComponent(token);
@@ -444,6 +596,9 @@ function peerRow(p, isSelf){
     actions += ` <button class="syncFromBtn" data-peer-id="${id}" title="Load their map here">Switch me</button>`
              + ` <button class="syncToBtn" data-peer-id="${id}" title="Load your map there">Set theirs</button>`;
   }
+  if(!isSelf && p.manual){
+    actions += ` <button class="peerRemoveBtn" data-peer-ip="${esc(p.ip||'')}" title="Remove this manual peer">Remove</button>`;
+  }
   return `<tr>
     <td>${dot}${esc(p.name||'?')}${isSelf?' <span class="muted">(you)</span>':''}</td>
     <td class="muted">${esc(p.ip||'')}</td>
@@ -475,6 +630,9 @@ async function loadPeers(){
   const same = PEERS.filter(p => p.in_sync==='same').length;
   const vdiff = PEERS.filter(p => p.version && SELF_VER && p.version !== SELF_VER).length;
   document.getElementById('peersEmpty').style.display = n ? 'none' : 'block';
+  document.getElementById('peersEmpty').innerHTML = (NETWORK && NETWORK.mode === 'lan')
+    ? 'No peers yet. Add a peer\u2019s IP above (both machines need the same session code).'
+    : 'No peers discovered. Start tailscaled, run both machines on the tailnet with the same session code, and reload.';
   let status;
   if(!n) status = 'no peers';
   else if(!reachable) status = 'no reachable peers';
@@ -561,6 +719,86 @@ async function stopLan(){
   loadLan();
 }
 
+// --- connection mode (Tailscale vs. local network) -------------------------
+function modeLabel(m){ return m === 'lan' ? 'Local network / L2 VPN' : 'Tailscale'; }
+function renderNetwork(){
+  if(!NETWORK) return;
+  const mode = NETWORK.mode;
+  document.getElementById('networkStatus').innerHTML = '<b>' + esc(modeLabel(mode)) + '</b>';
+  const hint = document.getElementById('networkHint');
+  if(mode === 'lan'){
+    const ip = NETWORK.lan_ip ? ' &middot; this machine: <code>' + esc(NETWORK.lan_ip) + '</code>' : '';
+    hint.innerHTML = 'Using your own network directly. Rocket League\u2019s native LAN discovery works '
+      + 'as-is here, so the relay panel is hidden.' + ip;
+  } else if(NETWORK.tailscale_available){
+    hint.innerHTML = 'Connecting over your tailnet'
+      + (NETWORK.tailnet_ip ? ' &middot; this machine: <code>' + esc(NETWORK.tailnet_ip) + '</code>' : '') + '.';
+  } else {
+    hint.innerHTML = NETWORK.tailscale_installed
+      ? 'Tailscale is selected but not running &mdash; start it with <code>sudo tailscale up</code>, or switch below.'
+      : 'Tailscale is selected but not installed &mdash; install it, or switch below.';
+  }
+  document.getElementById('lanPanel').style.display = mode === 'lan' ? 'none' : '';
+  document.getElementById('manualPeerRow').style.display = mode === 'lan' ? '' : 'none';
+}
+async function loadNetwork(){
+  try{ NETWORK = await (await api('/api/network')).json(); }catch(e){ return; }
+  renderNetwork();
+}
+function pickMode(mode){
+  const r = document.querySelector('input[name="netMode"][value="' + mode + '"]');
+  if(r) r.checked = true;
+  document.getElementById('optTs').classList.toggle('on', mode === 'tailscale');
+  document.getElementById('optLan').classList.toggle('on', mode === 'lan');
+}
+function openNetworkModal(){
+  pickMode(NETWORK ? NETWORK.mode : 'tailscale');
+  const det = document.getElementById('netModalDetect');
+  if(NETWORK){
+    det.innerHTML = NETWORK.tailscale_available
+      ? 'Tailscale detected: <code>' + esc(NETWORK.tailnet_ip || '') + '</code>.'
+      : (NETWORK.tailscale_installed
+         ? 'Tailscale is installed but not connected \u2014 start it with <code>sudo tailscale up</code>.'
+         : 'Tailscale not detected on this machine.');
+    if(NETWORK.lan_ip) det.innerHTML += '  This machine\u2019s LAN address: <code>' + esc(NETWORK.lan_ip) + '</code>.';
+  }
+  document.getElementById('netModal').style.display = '';
+}
+function closeNetworkModal(useTailscale){
+  document.getElementById('netModal').style.display = 'none';
+  if(useTailscale) saveNetworkMode('tailscale');
+}
+async function saveNetworkMode(force){
+  const box = document.querySelector('input[name="netMode"]:checked');
+  const mode = force || (box && box.value) || 'tailscale';
+  const r = await (await api('/api/network', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({mode})})).json();
+  if(r.ok){
+    NETWORK = r.network;
+    document.getElementById('netModal').style.display = 'none';
+    renderNetwork();
+    toast('Connection: ' + modeLabel(mode));
+    loadPeers(); loadLan();
+  } else toast('Error: ' + (r.error || 'failed'));
+}
+async function addManualPeer(){
+  const ip = (document.getElementById('peerIp').value || '').trim();
+  const name = (document.getElementById('peerName').value || '').trim();
+  if(!ip){ toast('Enter the peer IP'); return; }
+  const r = await (await api('/api/peers/manual', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({ip, name})})).json();
+  if(r.ok){
+    document.getElementById('peerIp').value = '';
+    document.getElementById('peerName').value = '';
+    toast('Peer added'); loadPeers();
+  } else toast('Error: ' + (r.error || 'failed'));
+}
+async function removeManualPeer(ip){
+  const r = await (await api('/api/peers/manual', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({ip, remove:true})})).json();
+  if(r.ok){ toast('Peer removed'); loadPeers(); } else toast('Error: ' + (r.error || 'failed'));
+}
+
 // One delegated listener instead of inline handlers: ids travel as element
 // data (HTML-escaped attributes) and are never interpolated into generated
 // JS source - inline "onclick=\"fn('${id}')\"" patterns are an injection trap
@@ -571,12 +809,19 @@ document.addEventListener('click', e => {
   if(btn.classList.contains('useBtn')) useMap(btn.dataset.mapId);
   else if(btn.classList.contains('syncFromBtn')) syncFrom(btn.dataset.peerId);
   else if(btn.classList.contains('syncToBtn')) syncTo(btn.dataset.peerId);
+  else if(btn.classList.contains('peerRemoveBtn')) removeManualPeer(btn.dataset.peerIp);
 });
 
-load_state(); loadSession(); loadPeers(); loadLan();
+load_state(); loadSession(); loadLan();
+loadNetwork().then(() => {
+  renderNetwork();
+  loadPeers();
+  if(NETWORK && NETWORK.needs_onboarding) openNetworkModal();
+});
 TIMERS.push(setInterval(load_state, 4000));
 TIMERS.push(setInterval(loadPeers, 8000));
 TIMERS.push(setInterval(loadLan, 5000));
+TIMERS.push(setInterval(loadNetwork, 15000));
 </script>
 </body></html>
 """
@@ -590,16 +835,24 @@ def make_handler(engine: dict):
     ident: dict = engine.get("ident") or {}
     port: int = int(engine.get("port") or DEFAULT_PORT)
     dev: bool = bool(engine.get("dev"))
+    engine.setdefault("network_mode", network_mode(engine.get("cfg") or {}))
 
+    def _ident() -> dict:
+        """This run's identity (re-read live: switching mode re-derives it)."""
+        return engine.get("ident") or ident
+
+    # Host allow-list: loopback, the bound host, this machine's own addresses
+    # (so a UI opened on a LAN/tailnet IP passes the Host check), and the
+    # tailnet DNS name. Source gating below still decides who may actually talk.
     allowed_hosts = {"127.0.0.1", "localhost", "::1", host}
-    for _ip in (ident.get("ips") or []):
-        allowed_hosts.add(_ip)
+    for _ip in ((ident.get("ips") or []) + local_ipv4s()):
+        allowed_hosts.add(str(_ip))
     if ident.get("dns"):
         allowed_hosts.add(ident["dns"])
-    # Addresses that count as "this machine" for the local-only gates: the
-    # bound host plus our own tailnet IPs. A UI served on the tailnet address
-    # is reached by the local browser *from* that address, not from 127.0.0.1.
-    own_ips = {host} | {str(_ip) for _ip in (ident.get("ips") or [])}
+    # Addresses that count as "this machine" for the local-only gates: the bound
+    # host plus every address of ours (tailnet and LAN). A UI served on such an
+    # address is reached by the local browser *from* it, not from 127.0.0.1.
+    own_ips = {host} | {str(_ip) for _ip in (ident.get("ips") or [])} | set(local_ipv4s())
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "rpmap"
@@ -651,10 +904,26 @@ def make_handler(engine: dict):
                 return True
             if dev and addr.is_private:
                 return True
+            if engine.get("network_mode") == MODE_LAN:
+                return addr.is_private      # LAN / L2 VPN only (100.64/10 is not "private")
             return addr in TAILNET
 
         def _host_ok(self) -> bool:
-            return (self.headers.get("Host") or "").split(":")[0] in allowed_hosts
+            host = (self.headers.get("Host") or "").split(":")[0]
+            if host in allowed_hosts:
+                return True
+            # A literal tailnet/LAN address is fine too: the source gate has
+            # already decided whether this client may talk to us, and this only
+            # needs to reject a foreign *name* (DNS-rebinding) or public IP.
+            try:
+                addr = ipaddress.ip_address(host)
+            except ValueError:
+                return False
+            if addr.is_loopback:
+                return True
+            if engine.get("network_mode") == MODE_LAN:
+                return addr.is_private
+            return addr in TAILNET
 
         def _local_ok(self) -> bool:
             """True only for a client on this machine - used to gate quitting
@@ -691,8 +960,8 @@ def make_handler(engine: dict):
                 return self._json({"cooked": str(cooked),
                                    "maps": [dict(m, key=map_key(m)) for m in list_maps(cooked)],
                                    "slot": slot_state(cooked, slot),
-                                   "peer": {"peer_id": ident.get("peer_id"),
-                                            "name": ident.get("name")}})
+                                   "peer": {"peer_id": _ident().get("peer_id"),
+                                            "name": _ident().get("name")}})
 
             if u.path == "/api/maps":
                 return self._json({"maps": map_inventory(cooked)})
@@ -700,7 +969,8 @@ def make_handler(engine: dict):
             if u.path == "/api/capabilities":
                 st = slot_state(cooked, slot)
                 return self._json({"product": PRODUCT, "version": APP_VERSION,
-                                   "peer_id": ident.get("peer_id"), "name": ident.get("name"),
+                                   "peer_id": _ident().get("peer_id"),
+                                   "name": _ident().get("name"),
                                    "port": port,
                                    "slot": {"slot": st["slot"], "state": st["state"],
                                             "map_name": st["map_name"], "size": st["size"],
@@ -708,9 +978,13 @@ def make_handler(engine: dict):
                                             "workshop_id": st.get("workshop_id")}})
 
             if u.path == "/api/session":
-                return self._json({"peer_id": ident.get("peer_id"), "name": ident.get("name"),
+                return self._json({"peer_id": _ident().get("peer_id"),
+                                   "name": _ident().get("name"),
                                    "port": port, "version": APP_VERSION,
                                    "secret": engine.get("secret") or ""})
+
+            if u.path == "/api/network":
+                return self._json(_network_status(engine))
 
             if u.path == "/api/preview":
                 mid = q.get("id", [""])[0]
@@ -722,7 +996,9 @@ def make_handler(engine: dict):
                 return self._json({"error": "no preview"}, 404)
 
             if u.path == "/api/peers":
-                return self._json(gather_peers(cooked, slot, engine.get("cfg") or {}, ident))
+                data = gather_peers(cooked, slot, engine.get("cfg") or {}, _ident())
+                data["manual_peers"] = (engine.get("cfg") or {}).get("manual_peers") or []
+                return self._json(data)
 
             if u.path == "/api/lan":
                 return self._json(_lan_status(engine))
@@ -768,6 +1044,14 @@ def make_handler(engine: dict):
                     engine.setdefault("cfg", {})["session_secret"] = new
                     save_config(engine["cfg"])
                     return self._json({"ok": True, "secret": new})
+                if u.path == "/api/network":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_network_set(engine, payload))
+                if u.path == "/api/peers/manual":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_peers_manual_set(engine, payload))
                 if u.path == "/api/peer/switch":
                     return self._json(peer_switch(cooked, slot, payload))
                 if u.path == "/api/sync":
@@ -777,6 +1061,11 @@ def make_handler(engine: dict):
                 if u.path == "/api/lan/start":
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)
+                    if engine.get("network_mode") == MODE_LAN:
+                        return self._json({
+                            "ok": False,
+                            "error": "The discovery relay isn't needed in local-network mode - "
+                                     "Rocket League's own LAN discovery works directly here."})
                     return self._json(_lan_start(engine, payload))
                 if u.path == "/api/lan/stop":
                     if not self._local_ok():
@@ -931,22 +1220,34 @@ def _restore_on_exit(cooked: Path, slot: str) -> None:
 
 def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
                secret: str | None = None, dev: bool = False,
+               network: str | None = None,
                restore_on_exit: bool = False, window: bool = True) -> int:
     cfg = load_config()
     if secret:
         cfg["session_secret"] = secret
+    if network in NETWORK_MODES:
+        cfg["network_mode"] = network
     if not cfg.get("session_secret"):
         cfg["session_secret"] = new_secret()
     if not cfg.get("port"):
         cfg["port"] = port
     save_config(cfg)
+    mode = network_mode(cfg)
+    if not host:
+        host = "0.0.0.0"          # all interfaces; requests are gated by source IP
     ident = local_identity(cfg)
     token = secrets.token_urlsafe(16)
     actual = _find_port(port) if host == "127.0.0.1" else port
     engine = {"cooked": cooked, "slot": slot, "token": token, "host": host,
               "secret": cfg["session_secret"], "cfg": cfg, "ident": ident,
-              "dev": dev, "port": actual}
-    httpd = _HttpServer((host, actual), make_handler(engine))
+              "dev": dev, "port": actual, "network_mode": mode}
+    try:
+        httpd = _HttpServer((host, actual), make_handler(engine))
+    except OSError as e:
+        print(f"could not listen on {host}:{actual}: {e}", file=sys.stderr)
+        print("hint: another rpmap may already be running (`rpmap stop`), "
+              "or pass a different --port", file=sys.stderr)
+        return 1
     write_runtime({"pid": os.getpid(), "port": actual, "host": host,
                    "token": token, "version": APP_VERSION,
                    "started": int(time.time())})
@@ -954,11 +1255,18 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
     print(f"rpmap UI  ->  {url}", flush=True)
     print(f"slot: {SLOTS[slot][0]}   cooked: {cooked}", flush=True)
     print(f"peer: {ident['name']} ({ident['peer_id']})", flush=True)
+    ips = ident.get("ips") or []
+    if mode == MODE_LAN:
+        print(f"network: local network ({ips[0] if ips else 'no LAN address found'})",
+              flush=True)
+    else:
+        print(f"network: Tailscale ({ips[0] if ips else 'not up - run `sudo tailscale up`'})",
+              flush=True)
     print(f"session: {cfg['session_secret']}   <- share with peers / paste in the UI", flush=True)
     if host == "127.0.0.1":
-        print("hint: for peer sync run:  serve --host <tailscale-ip>", flush=True)
+        print("hint: for peer sync run:  rpmap serve --host <your-ip>", flush=True)
     else:
-        print(f"note: bound to {host}; peers reach this on port {actual}", flush=True)
+        print(f"note: listening on {host}:{actual}; peers reach this on your network", flush=True)
     print("quit:  the UI's Quit button, the status window, or `rpmap stop`", flush=True)
     if auto_open:
         threading.Thread(target=lambda: open_browser(url), daemon=True).start()
@@ -998,7 +1306,7 @@ def _run_with_window(cooked: Path, slot: str, httpd, engine: dict, url: str) -> 
         httpd.shutdown()
         quit_event.set()
 
-    def _status() -> tuple[str, str]:
+    def _status() -> tuple[str, str, str]:
         st = slot_state(cooked, slot)
         arena = SLOT_INFO.get(slot, {}).get("arena", slot)
         if st["state"] == "stock":
@@ -1008,7 +1316,9 @@ def _run_with_window(cooked: Path, slot: str, httpd, engine: dict, url: str) -> 
         else:
             what = {"custom": "custom map", "missing": "slot file missing",
                     "unknown": "unrecognised map"}.get(st["state"], st["state"])
-        return arena, what
+        mode = engine.get("network_mode") or MODE_TAILSCALE
+        where = "local network" if mode == MODE_LAN else "Tailscale"
+        return arena, what, where
 
     def _restore() -> None:
         try:
