@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
+import rpmap_lan
 import rpmap_window
 from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
                           TAILNET, clear_runtime, load_config, new_secret,
@@ -27,6 +28,79 @@ from rpmap_config import (APP_VERSION, DEFAULT_PORT, PRODUCT, SLOTS, SLOT_INFO,
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
 from rpmap_peers import gather_peers, local_identity, peer_switch, sync_action
+
+
+# --------------------------------------------------------------------------- #
+# LAN discovery relay (started/stopped from the UI; one per machine)
+# --------------------------------------------------------------------------- #
+
+def _lan_status(engine: dict) -> dict:
+    relay = engine.get("lan")
+    if not relay:
+        return {"running": False, "error": None}
+    return {
+        "running": bool(relay.running),
+        "mode": relay.mode,
+        "host": relay.host,
+        "peers": list(relay.peers or []),
+        "relay_port": relay.relay_port,
+        "inject": relay.inject_mode,
+        "error": relay.error,
+    }
+
+
+def _lan_start(engine: dict, payload: dict) -> dict:
+    relay = engine.get("lan")
+    if relay and relay.running:
+        return {"ok": False, "error": "relay already running", "lan": _lan_status(engine)}
+
+    mode = str(payload.get("mode") or "host")
+    if mode not in ("host", "join"):
+        return {"ok": False, "error": "mode must be 'host' or 'join'"}
+
+    token = engine.get("secret") or ""
+    if not token:
+        return {"ok": False, "error": "no session code set"}
+
+    host = (payload.get("host") or "").strip() or None
+    peers = None
+    if mode == "host":
+        peers = rpmap_lan.resolve_peers(engine.get("cfg") or {}, payload.get("peers"))
+        if not peers:
+            return {"ok": False, "error": "no peers online (need a tailnet peer)"}
+    elif not host:
+        return {"ok": False, "error": "join needs the host's tailnet IP"}
+
+    try:
+        relay_port = int(payload.get("relay_port") or rpmap_lan.DEFAULT_RELAY_PORT)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad relay port"}
+
+    factory = engine.get("relay_factory") or rpmap_lan.Relay
+    try:
+        relay = factory(
+            mode=mode, token=token, peers=peers, host=host,
+            advertise=payload.get("advertise") or None,
+            relay_port=relay_port, bind=payload.get("bind") or None,
+            inject_mode="broadcast", lan_port=rpmap_lan.LAN_PORT,
+            dev=bool(engine.get("dev")), log=engine.get("lan_log") or print)
+        if not relay.start():
+            return {"ok": False, "error": "relay already running"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    engine["lan"] = relay
+    status = _lan_status(engine)
+    if status.get("error"):
+        return {"ok": False, "error": status["error"], "lan": status}
+    return {"ok": True, "lan": status}
+
+
+def _lan_stop(engine: dict) -> dict:
+    relay = engine.get("lan")
+    if relay and relay.running and not relay.stop():
+        return {"ok": False, "error": "relay did not stop", "lan": _lan_status(engine)}
+    return {"ok": True, "lan": _lan_status(engine)}
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +239,27 @@ PAGE = r"""<!doctype html>
     <div class="muted" id="peersEmpty" style="margin-top:6px;display:none">
       No peers discovered. Start tailscaled, run both machines on the tailnet with the
       same session code, and reload.
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <b>LAN discovery relay</b>
+      <span class="grow"></span>
+      <span class="muted" id="lanStatus">checking...</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="muted"><input type="radio" name="lanMode" value="host" checked onchange="renderLan()"> I'm hosting</label>
+      <label class="muted"><input type="radio" name="lanMode" value="join" onchange="renderLan()"> I'm joining</label>
+      <input class="search" id="lanHost" placeholder="Host's tailnet IP (100.x.y.z)" style="display:none">
+      <span class="grow"></span>
+      <button class="primary" id="lanStart" onclick="startLan()">Start relay</button>
+      <button class="danger" id="lanStop" onclick="stopLan()" disabled>Stop</button>
+    </div>
+    <div class="muted" id="lanHint" style="margin-top:6px">
+      Relays Rocket League's in-game <b>Create LAN / Join LAN</b> discovery across the tailnet
+      (everyone needs the same session code). It carries <b>only discovery</b> &mdash; the match
+      itself runs over Tailscale; prefer a direct path over a DERP relay.
     </div>
   </div>
 </main>
@@ -428,6 +523,44 @@ function syncFrom(id){ const p=findPeer(id); if(p) doSync('pull', [peerTarget(p)
 function syncTo(id){ const p=findPeer(id); if(p) doSync('push', [peerTarget(p)]); }
 function syncAll(){ doSync('push', (PEERS||[]).filter(p=>p.rpmap).map(peerTarget)); }
 
+let LAN = null;
+function lanMode(){ const r = document.querySelector('input[name="lanMode"]:checked'); return r ? r.value : 'host'; }
+function fmtLanPeers(p){ return (p && p.length) ? p.join(', ') : 'all online peers'; }
+function renderLan(){
+  const join = lanMode() === 'join';
+  document.getElementById('lanHost').style.display = join ? '' : 'none';
+  const L = LAN || {};
+  const st = document.getElementById('lanStatus');
+  if(L.running){
+    st.innerHTML = '<span class="badge b-stock">relaying</span> '
+      + (L.mode === 'join' ? 'joining ' + esc(L.host || '?') : 'hosting &rarr; ' + esc(fmtLanPeers(L.peers)));
+  } else if(L.error){
+    st.innerHTML = '<span class="badge b-unknown">stopped</span> ' + esc(L.error);
+  } else {
+    st.innerHTML = '<span class="badge b-missing">idle</span>';
+  }
+  document.getElementById('lanStart').disabled = !!L.running;
+  document.getElementById('lanStop').disabled = !L.running;
+}
+async function loadLan(){
+  try{ LAN = await (await api('/api/lan')).json(); }catch(e){ return; }
+  renderLan();
+}
+async function startLan(){
+  const mode = lanMode();
+  const host = (document.getElementById('lanHost').value || '').trim();
+  if(mode === 'join' && !host){ toast('Enter the host tailnet IP'); return; }
+  const r = await (await api('/api/lan/start', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({mode, host})})).json();
+  if(r.ok) toast('LAN relay started'); else toast('Error: ' + (r.error || 'failed'));
+  loadLan();
+}
+async function stopLan(){
+  const r = await (await api('/api/lan/stop', {method:'POST'})).json();
+  if(r.ok) toast('LAN relay stopped'); else toast('Error: ' + (r.error || 'failed'));
+  loadLan();
+}
+
 // One delegated listener instead of inline handlers: ids travel as element
 // data (HTML-escaped attributes) and are never interpolated into generated
 // JS source - inline "onclick=\"fn('${id}')\"" patterns are an injection trap
@@ -440,9 +573,10 @@ document.addEventListener('click', e => {
   else if(btn.classList.contains('syncToBtn')) syncTo(btn.dataset.peerId);
 });
 
-load_state(); loadSession(); loadPeers();
+load_state(); loadSession(); loadPeers(); loadLan();
 TIMERS.push(setInterval(load_state, 4000));
 TIMERS.push(setInterval(loadPeers, 8000));
+TIMERS.push(setInterval(loadLan, 5000));
 </script>
 </body></html>
 """
@@ -590,6 +724,9 @@ def make_handler(engine: dict):
             if u.path == "/api/peers":
                 return self._json(gather_peers(cooked, slot, engine.get("cfg") or {}, ident))
 
+            if u.path == "/api/lan":
+                return self._json(_lan_status(engine))
+
             return self._json({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -637,6 +774,14 @@ def make_handler(engine: dict):
                     return self._json(sync_action(cooked, slot, engine.get("cfg") or {},
                                                   str(payload.get("mode") or "push"),
                                                   payload.get("peers") or []))
+                if u.path == "/api/lan/start":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_lan_start(engine, payload))
+                if u.path == "/api/lan/stop":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_lan_stop(engine))
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
             return self._json({"error": "not found"}, 404)
@@ -828,6 +973,9 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
         except KeyboardInterrupt:
             pass
 
+    lan = engine.get("lan")
+    if lan:
+        lan.stop()
     clear_runtime(os.getpid())
     if restore_on_exit:
         _restore_on_exit(cooked, slot)

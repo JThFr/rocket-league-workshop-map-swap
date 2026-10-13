@@ -47,6 +47,33 @@ def _lan_msg(class_name: str, payload: bytes) -> bytes:
     return struct.pack(">I", len(name)) + name + b"\x00" + payload
 
 
+class _FakeRelay:
+    """Stand-in for rpmap_lan.Relay so UI tests never bind the game ports."""
+
+    def __init__(self, **kw):
+        self.mode = kw.get("mode")
+        self.host = kw.get("host")
+        self.peers = kw.get("peers") or []
+        self.relay_port = kw.get("relay_port")
+        self.inject_mode = kw.get("inject_mode")
+        self.error = None
+        self._running = False
+
+    @property
+    def running(self):
+        return self._running
+
+    def start(self):
+        if self._running:
+            return False
+        self._running = True
+        return True
+
+    def stop(self, timeout=3.0):
+        self._running = False
+        return True
+
+
 def setUpModule() -> None:
     # Isolate config/cache/map discovery from the developer's real home.
     tmp = tempfile.mkdtemp(prefix="rpmap-test-")
@@ -239,7 +266,7 @@ class PeerTests(unittest.TestCase):
 
 
 class LanRelayTests(unittest.TestCase):
-    """The native LAN discovery relay core (`docs/rl-lan-relay.md`)."""
+    """The native LAN discovery relay core."""
 
     QUERY = _lan_msg(
         "ProjectX.LanMessage_HostQuery_X",
@@ -316,6 +343,52 @@ class LanRelayTests(unittest.TestCase):
         self.assertTrue(seen.fresh(b"abc"))
         self.assertFalse(seen.fresh(b"abc"))
         self.assertTrue(seen.fresh(b"def"))
+
+
+class LanRelayControllerTests(unittest.TestCase):
+    """The threaded `Relay` controller (the web UI drives this)."""
+
+    def test_start_and_stop_run_the_loop_off_the_main_thread(self):
+        orig = lan.run_host
+        started = threading.Event()
+
+        def fake_run(*, peers, token, stop_event=None, **kw):
+            started.set()
+            while not stop_event.is_set():
+                time.sleep(0.01)
+            return 0
+
+        lan.run_host = fake_run
+        try:
+            relay = lan.Relay(mode="host", token="t", peers=["100.0.0.2"],
+                              advertise="100.0.0.1")
+            self.assertFalse(relay.running)
+            self.assertTrue(relay.start())
+            self.assertTrue(started.wait(2), "relay loop never started")
+            self.assertTrue(relay.running)
+            self.assertFalse(relay.start(), "a second start must be refused")
+            self.assertTrue(relay.stop())
+            self.assertFalse(relay.running)
+        finally:
+            lan.run_host = orig
+
+    def test_setup_error_is_captured_not_raised(self):
+        orig = lan.run_join
+
+        def boom(**kw):
+            raise SystemExit("no Tailscale IPv4 detected")
+
+        lan.run_join = boom
+        try:
+            relay = lan.Relay(mode="join", token="t", host="100.0.0.2")
+            relay.start()
+            for _ in range(100):
+                if relay.error:
+                    break
+                time.sleep(0.02)
+            self.assertIn("Tailscale", relay.error or "")
+        finally:
+            lan.run_join = orig
 
 
 class SyncTargetTests(_CookedFixture):
@@ -471,7 +544,7 @@ class HttpTests(_CookedFixture):
     def setUp(self) -> None:
         super().setUp()
         self.quit_called = threading.Event()
-        engine = {
+        self.engine = engine = {
             "cooked": self.cooked, "slot": "underpass", "token": self.TOKEN,
             "host": "127.0.0.1", "secret": "s3cr3t", "cfg": {},
             "ident": {"peer_id": "tester", "name": "tester", "ips": [], "dns": ""},
@@ -609,6 +682,60 @@ class HttpTests(_CookedFixture):
                               "token": self.TOKEN})
         self.assertIsNone(web.running_instance())
         config.clear_runtime(10_000_000)
+
+    def test_lan_status_starts_idle(self):
+        status, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["running"])
+
+    def test_lan_start_requires_a_token(self):
+        self.assertEqual(self._req("POST", "/api/lan/start")[0], 403)
+
+    def test_ui_exposes_the_lan_relay_panel(self):
+        _, body = self._req("GET", "/")
+        self.assertIn(b"LAN discovery relay", body)
+        self.assertIn(b"startLan(", body)
+        self.assertIn(b"stopLan(", body)
+
+    def test_lan_join_needs_a_host(self):
+        status, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                 body={"mode": "join"})
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("host", json.loads(body)["error"])
+
+    def test_lan_host_without_peers_is_refused(self):
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: []
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "host"})
+        finally:
+            lan.resolve_peers = orig
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("peer", json.loads(body)["error"])
+
+    def test_lan_start_and_stop_roundtrip(self):
+        self.engine["relay_factory"] = _FakeRelay
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: ["100.64.0.7"]
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "host"})
+            started = json.loads(body)
+            self.assertTrue(started["ok"], body)
+            self.assertTrue(started["lan"]["running"])
+            self.assertEqual(started["lan"]["mode"], "host")
+        finally:
+            lan.resolve_peers = orig
+
+        _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["running"])
+
+        _, body = self._req("POST", "/api/lan/stop?token=" + self.TOKEN)
+        self.assertTrue(json.loads(body)["ok"])
+        _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
+        self.assertFalse(json.loads(body)["running"])
 
 
 class EveryoneFilterTests(unittest.TestCase):

@@ -134,6 +134,10 @@ Then: the host **creates a LAN match**; each joiner opens the **Join LAN / local
 host's lobby appears, and clicking it **connects directly to the host's `100.x:7777`** over
 Tailscale. Only the discovery is relayed — the match itself is a normal Tailscale connection.
 
+You can also run it entirely from the **web UI's "LAN discovery relay" panel**: choose
+**I'm hosting** or **I'm joining** (enter the host's tailnet IP), then **Start relay** / **Stop**.
+The panel shows whether it's relaying, and quitting rpmap stops it.
+
 - The shared **session code** is the relay token by default (`~/.config/rpmap/config.json`, or
   `rpmap session`), so both sides just need the same code; `--token` overrides.
 - `lan-host` targets **all online tailnet peers** by default (`--peer <ip>` to restrict).
@@ -142,8 +146,8 @@ Tailscale. Only the discovery is relayed — the match itself is a normal Tailsc
   (default `14001`) and `--advertise <ip>` (host: the address written into the lobby reply) are
   available when needed.
 - Keep **no-EAC** launches, as with any mod-adjacent tooling.
-- The relay was validated in-game Linux→Windows; design and the latency notes (prefer a
-  **direct** tailnet path over a DERP relay) are in the parent project's `docs/rl-lan-relay.md`.
+- The relay was validated in-game between a Linux host and a Windows peer. Prefer a **direct**
+  tailnet path over a DERP relay for latency.
 
 ## Troubleshooting
 

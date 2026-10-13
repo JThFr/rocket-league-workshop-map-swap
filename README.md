@@ -37,8 +37,9 @@ in the way, and this tool exists to smooth them out:
 4. **Native LAN discovery (relay).** Rocket League's built-in **Create LAN / Join LAN** list
    normally can't cross the internet, because the discovery broadcast never leaves the local
    network. `rpmap lan-host` / `lan-join` relay that discovery between tailnet peers, so the
-   in-game lobby list works — no BakkesMod or Rocket Plugin needed just to *find* the host. The
-   match itself still connects directly over Tailscale.
+   in-game lobby list works — no BakkesMod or Rocket Plugin needed just to *find* the host (you
+   can also start/stop the relay from the web UI). The match itself still connects directly over
+   Tailscale.
 
 ## Get it
 
@@ -117,5 +118,4 @@ python3 rpmap.py lan-join --host <host-tailnet-ip>
 Both sides use the shared **session code** (the relay token defaults to it). On the joiner, open
 the game's **Join LAN / local lobby** list — the host's lobby appears and connects straight to the
 host's `100.x:7777`. The relay carries **only discovery**; the match itself runs over Tailscale.
-Validated in-game Linux→Windows; design and results live in the parent project's
-`docs/rl-lan-relay.md`.
+Validated in-game between a Linux host and a Windows peer.

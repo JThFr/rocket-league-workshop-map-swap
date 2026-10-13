@@ -1,4 +1,4 @@
-"""Native LAN discovery relay over Tailscale - the ``rl-lan-relay`` PoC, productised.
+"""Native LAN discovery relay over Tailscale - productised from a proven PoC.
 
 Rocket League's in-game **Create LAN / Join LAN** discovery broadcasts to
 ``255.255.255.255:14001``. The kernel routes that out the default NIC, so a
@@ -14,7 +14,7 @@ Discovery is the only thing relayed. Once the peer clicks the lobby, the game
 connects straight to ``<host tailnet ip>:7777`` over Tailscale - the same path
 Rocket Plugin already proves works - so nothing here touches the game connection.
 
-Protocol (decoded from a live capture - see ``docs/rl-lan-relay.md``):
+Protocol (decoded from a live capture):
 
 * ``ProjectX.LanMessage_HostQuery_X``    client -> broadcast:14001
 * ``ProjectX.LanMessage_HostResponse_X`` host   -> broadcast:14001 (echoes the query's nonce)
@@ -25,7 +25,8 @@ A response echoes the query's ``Nonce``, so the relay is **bidirectional** - a
 canned beacon cannot be replayed, it has to round-trip the real query.
 
 Layering: depends on ``rpmap_config`` (the tailnet net) and ``rpmap_peers`` (the
-tailnet roster); imported by the CLI only.
+tailnet roster); imported by the CLI (``lan-host`` / ``lan-join``) and by the web
+UI (the "LAN discovery relay" panel, via the threaded :class:`Relay`).
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import ipaddress
 import re
 import select
 import socket
+import threading
 import time
 
 from rpmap_config import TAILNET
@@ -147,8 +149,7 @@ def make_capture_socket(lan_port: int = LAN_PORT) -> socket.socket:
     **default NIC** - never ``tailscale0`` - so the capture socket must listen on
     every interface. On Linux broadcast datagrams are delivered to *all* matching
     sockets, so the game keeps working; ``SO_REUSEADDR`` is what lets us share the
-    port. (On Windows this is the one unproven piece - see the risk table in
-    ``docs/rl-lan-relay.md``.)
+    port (verified on both Linux and Windows).
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -253,7 +254,7 @@ def _close_all(*socks: socket.socket) -> None:
 def run_host(*, peers: list[str], token: str, advertise: str | None = None,
              relay_port: int = DEFAULT_RELAY_PORT, bind: str | None = None,
              inject_mode: str = "broadcast", lan_port: int = LAN_PORT,
-             dev: bool = False, log=print) -> int:
+             dev: bool = False, log=print, stop_event=None) -> int:
     """Run on the machine hosting the LAN match.
 
     Captures each ``HostResponse``, rewrites its ``ServerID`` to this machine's
@@ -277,7 +278,7 @@ def run_host(*, peers: list[str], token: str, advertise: str | None = None,
         f"bind={bind}  inject={inject_mode}")
     log("lan-host: create a LAN match in Rocket League; waiting for discovery...")
     try:
-        while True:
+        while not (stop_event is not None and stop_event.is_set()):
             ready, _, _ = select.select([cap, relay], [], [], 1.0)
             for s in ready:
                 data, addr = s.recvfrom(65535)
@@ -323,7 +324,8 @@ def run_host(*, peers: list[str], token: str, advertise: str | None = None,
 
 def run_join(*, host: str, token: str, relay_port: int = DEFAULT_RELAY_PORT,
              bind: str | None = None, inject_mode: str = "broadcast",
-             lan_port: int = LAN_PORT, dev: bool = False, log=print) -> int:
+             lan_port: int = LAN_PORT, dev: bool = False, log=print,
+             stop_event=None) -> int:
     """Run on a machine joining the LAN match.
 
     Captures each ``HostQuery`` the local game broadcasts, unicasts it to the
@@ -340,7 +342,7 @@ def run_join(*, host: str, token: str, relay_port: int = DEFAULT_RELAY_PORT,
         f"inject={inject_mode}")
     log("lan-join: open Rocket League's Join LAN / local lobby list; waiting...")
     try:
-        while True:
+        while not (stop_event is not None and stop_event.is_set()):
             ready, _, _ = select.select([cap, relay], [], [], 1.0)
             for s in ready:
                 data, addr = s.recvfrom(65535)
@@ -374,3 +376,79 @@ def run_join(*, host: str, token: str, relay_port: int = DEFAULT_RELAY_PORT,
     finally:
         _close_all(cap, relay, inj)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Threaded controller (used by the web UI; the CLI runs run_host/run_join directly)
+# --------------------------------------------------------------------------- #
+
+class Relay:
+    """A LAN discovery relay that runs in a background thread.
+
+    One relay per machine at a time. ``start()`` returns immediately; ``stop()``
+    signals the loop and joins it. A fatal setup error (no tailnet address, no
+    peers, a busy port) is caught by the thread and exposed as ``error`` instead
+    of being raised, so the UI can show it without crashing the server.
+    """
+
+    def __init__(self, *, mode: str, token: str, peers: list[str] | None = None,
+                 host: str | None = None, advertise: str | None = None,
+                 relay_port: int = DEFAULT_RELAY_PORT, bind: str | None = None,
+                 inject_mode: str = "broadcast", lan_port: int = LAN_PORT,
+                 dev: bool = False, log=print):
+        self.mode = mode
+        self.token = token
+        self.peers = list(peers or [])
+        self.host = host
+        self.advertise = advertise
+        self.relay_port = relay_port
+        self.bind = bind
+        self.inject_mode = inject_mode
+        self.lan_port = lan_port
+        self.dev = dev
+        self.log = log
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> bool:
+        """Spawn the relay thread; False if one is already running."""
+        if self.running:
+            return False
+        self._stop.clear()
+        self.error = None
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"rpmap-lan-{self.mode}")
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float = 3.0) -> bool:
+        """Signal the loop to end and wait for it; True if it stopped cleanly."""
+        if self._thread is None:
+            return False
+        self._stop.set()
+        self._thread.join(timeout)
+        alive = self._thread.is_alive()
+        self._thread = None
+        return not alive
+
+    def _run(self) -> None:
+        try:
+            if self.mode == "join":
+                run_join(host=self.host, token=self.token, relay_port=self.relay_port,
+                         bind=self.bind, inject_mode=self.inject_mode,
+                         lan_port=self.lan_port, dev=self.dev, log=self.log,
+                         stop_event=self._stop)
+            else:
+                run_host(peers=self.peers, token=self.token, advertise=self.advertise,
+                         relay_port=self.relay_port, bind=self.bind,
+                         inject_mode=self.inject_mode, lan_port=self.lan_port,
+                         dev=self.dev, log=self.log, stop_event=self._stop)
+        except SystemExit as e:              # run_* raise this for setup errors
+            self.error = str(e)
+        except Exception as e:               # keep the thread (and the UI) alive
+            self.error = str(e)
