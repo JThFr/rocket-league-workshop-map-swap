@@ -35,8 +35,8 @@ from rpmap_config import (APP_VERSION, AUTO_UPDATE_MODES, DEFAULT_PORT,
 from rpmap_maps import (get_preview_bytes, list_maps, map_inventory, map_key,
                         restore_slot, slot_state, use_map)
 from rpmap_peers import (gather_peers, known_peers, local_identity, local_ipv4s,
-                         peer_switch, sync_action, tailscale_installed,
-                         tailscale_self)
+                         local_ping_avg, peer_switch, sync_action,
+                         tailscale_installed, tailscale_self)
 
 
 # --------------------------------------------------------------------------- #
@@ -336,6 +336,18 @@ PAGE = r"""<!doctype html>
   .b-custom{background:#d2992233;color:#e3b341;border:1px solid var(--warn)}
   .b-unknown{background:#da363333;color:#ff7b72;border:1px solid var(--red)}
   .b-missing{background:#6e768133;color:#8b949e;border:1px solid #6e7681}
+  .b-host{background:#3fb95033;color:#56d364;border:1px solid #3fb950}
+  /* ping: three bars, small -> tall; filled count + colour track latency */
+  .bars{display:inline-flex;align-items:flex-end;gap:2px;height:14px;vertical-align:middle;margin-right:6px}
+  .bars i{width:4px;background:currentColor;border-radius:1px;opacity:.22}
+  .bars i:nth-child(1){height:6px}
+  .bars i:nth-child(2){height:10px}
+  .bars i:nth-child(3){height:14px}
+  .bars i.on{opacity:1}
+  .bars.good{color:#3fb950}
+  .bars.ok{color:#d29922}
+  .bars.bad{color:#f85149}
+  .bars.none{color:#8b949e}
   main{padding:18px 22px;max-width:1240px;margin:0 auto}
 
   /* hero: what is currently loaded */
@@ -780,8 +792,31 @@ function reachLabel(p){
   if(p.reach==='no-inventory') return '<span class="badge b-custom">rpmap \u00b7 no map list</span>';
   return '<span class="badge b-missing">unreachable</span>';
 }
+// Latency as three bars (small -> tall): 3 filled/green < 100 ms, 2/orange
+// < 200 ms, 1/red above. Grey when we have no measurement yet. The number is
+// our round-trip to that peer; the muted "avg" is the peer's own average ping
+// to everyone (self-reported, so the recommended host is visible too).
+function pingCell(p, isSelf){
+  const ms = p.ping_ms;
+  let out;
+  if(ms == null){
+    out = '<span class="bars none" title="not measured yet"><i></i><i></i><i></i></span>';
+  } else {
+    const tier = ms < 100 ? 3 : ms < 200 ? 2 : 1;
+    const cls = tier === 3 ? 'good' : tier === 2 ? 'ok' : 'bad';
+    const bars = [1,2,3].map(n => `<i class="${n<=tier?'on':''}"></i>`).join('');
+    out = `<span class="bars ${cls}" title="${Math.round(ms)} ms to this peer">${bars}</span>`
+        + `<span>${Math.round(ms)} ms</span>`;
+  }
+  if(isSelf) out += ' <span class="muted">(your avg)</span>';
+  else if(p.peer_avg_ms != null)
+    out += ` <span class="muted" title="Their average ping to everyone">\u00b7 avg ${Math.round(p.peer_avg_ms)} ms</span>`;
+  return out;
+}
 function peerRow(p, isSelf){
   const dot = `<span class="dot ${p.online?'on':'off'}"></span>`;
+  const crown = p.recommended
+    ? ' <span class="badge b-host" title="Lowest average ping - best host">\u2605 host</span>' : '';
   const slot = p.slot || {};
   const arena = slot.arena ? ' <span class="muted">\u00b7 ' + esc(slot.arena) + '</span>' : '';
   const mapsN = p.map_count != null ? ' <span class="muted">\u00b7 ' + p.map_count + ' maps</span>' : '';
@@ -809,13 +844,14 @@ function peerRow(p, isSelf){
     actions += ` <button class="peerRemoveBtn" data-peer-ip="${esc(p.ip||'')}" title="Remove this manual peer">Remove</button>`;
   }
   return `<tr>
-    <td>${dot}${esc(p.name||'?')}${isSelf?' <span class="muted">(you)</span>':''}</td>
+    <td>${dot}${esc(p.name||'?')}${isSelf?' <span class="muted">(you)</span>':''}${crown}</td>
     <td class="muted">${esc(p.ip||'')}</td>
     <td>${verCell}</td>
     <td>${map}</td>
     <td class="muted">${size}</td>
     <td>${hash}</td>
     <td style="text-align:right;white-space:nowrap">${actions}</td>
+    <td style="white-space:nowrap">${pingCell(p, isSelf)}</td>
   </tr>`;
 }
 let PEERS = null;
@@ -829,10 +865,12 @@ async function loadPeers(){
   SELF_VER = self.version || '';
   COMMON = Array.isArray(P.common) ? P.common : null;
   const rows = [ peerRow({name:self.name, ip:self.ip, online:true, slot:self.slot,
-                          sha256:self.sha256, version:self.version, in_sync:'same'}, true) ];
+                          sha256:self.sha256, version:self.version, in_sync:'same',
+                          map_count:self.map_count, ping_ms:self.ping_ms,
+                          recommended:self.recommended}, true) ];
   PEERS.forEach(p => rows.push(peerRow(p, false)));
   document.getElementById('peerTable').innerHTML =
-    '<tr><th>Player</th><th>IP</th><th>Version</th><th>Loaded map</th><th>Size</th><th>Hash</th><th></th></tr>'
+    '<tr><th>Player</th><th>IP</th><th>Version</th><th>Loaded map</th><th>Size</th><th>Hash</th><th></th><th>Ping</th></tr>'
     + rows.join('');
   const n = PEERS.length;
   const reachable = PEERS.filter(p => p.rpmap).length;
@@ -1438,12 +1476,17 @@ def make_handler(engine: dict):
             if u.path == "/api/maps":
                 return self._json({"maps": map_inventory(cooked)})
 
+            if u.path == "/api/ping":
+                # Lightweight latency target: peers time a round-trip to this.
+                return self._json({"ok": True})
+
             if u.path == "/api/capabilities":
                 st = slot_state(cooked, slot)
                 return self._json({"product": PRODUCT, "version": APP_VERSION,
                                    "peer_id": _ident().get("peer_id"),
                                    "name": _ident().get("name"),
                                    "port": port,
+                                   "ping_ms": local_ping_avg(),
                                    "slot": {"slot": st["slot"], "state": st["state"],
                                             "map_name": st["map_name"], "size": st["size"],
                                             "sha256": st.get("sha256") or None,
