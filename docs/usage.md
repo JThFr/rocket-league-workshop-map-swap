@@ -202,8 +202,9 @@ Exit code is non-zero only when a hard check fails (e.g. Rocket League not found
 - Per-user config lives in `%APPDATA%\rpmap\config.json` (Windows) or
   `~/.config/rpmap/config.json` (Linux); preview cache in the matching local cache dir.
   It holds `network_mode` (`tailscale` or `lan`), `auto_update` (`off`, `check` or `auto`;
-  unset until answered), the `session_secret`, the display `name`, and any `manual_peers`
-  (used in local-network mode).
+  unset until answered), `last_seen_version` (the version the app last ran at, used to announce
+  what changed after an update), the `session_secret`, the display `name`, and any
+  `manual_peers` (used in local-network mode).
 - While the UI is running it also writes `runtime.json` next to the config (mode `0600`, removed
   on a clean exit) so `rpmap stop` and a second launch can find the live server. It holds this
   run's UI token, which is regenerated every time the server starts.
@@ -229,6 +230,12 @@ The **Updates** panel also shows the current version and, when a newer release e
 now** and a link to the GitHub release. Running from source (the `.py`) never self-updates — it
 only offers the check and the release link. `--no-update-check` skips the startup check
 entirely, and `rpmap check-update` checks from the command line.
+
+When a packaged build starts at a version **different from the last one it ran**, it shows a
+**What's new** popup listing the release notes (from GitHub) for every version in between — so
+after an update you can see what changed since the version you were on. It shows once per version
+and is also available any time from the **What's new** button in the **Updates** panel. On a source
+checkout it never appears, and if GitHub can't be reached the popup just links to the releases page.
 
 The relaunched build is detached (no terminal), so once it's up you stop it with the UI's
 **Quit** button or `rpmap stop` — not Ctrl+C.

@@ -110,7 +110,9 @@ you, but never install it), or **Install automatically** — which means **trust
 the repository** to publish whatever they want (downloads are `sha256`-verified and only
 accepted from this project's official GitHub releases). Until you choose, rpmap doesn't contact
 GitHub. The web UI's **Updates** panel shows your version, the chosen mode, a **Check for
-updates** button, and a link to the GitHub release. See
+updates** button, and a link to the GitHub release. After an update, a packaged build shows a
+**What's new** popup with the release notes for the versions it changed through (also reopenable
+from the **Updates** panel). See
 [docs/usage.md](docs/usage.md#updates) for the details.
 
 ## Usage
