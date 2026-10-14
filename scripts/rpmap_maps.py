@@ -298,6 +298,34 @@ def _find_map_file(folder: Path) -> Path | None:
     return best
 
 
+def _workshop_dirs(cooked: Path) -> list[Path]:
+    """Steam Workshop content folders for Rocket League (appid 252950).
+
+    Normally the cooked install's own Steam library, but every Steam library we
+    can find is also scanned: an Epic-cooked install (which has no ``steamapps``
+    of its own) or content on a second drive still sees the maps the player
+    subscribed to on Steam. Deduped, in a stable order.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+    steamapps: list[Path] = []
+    sa = steamapps_from_cooked(cooked)
+    if sa:
+        steamapps.append(sa)
+    steamapps += [lib / "steamapps" for lib in _steam_libraries()]
+    for base in steamapps:
+        ws = base / "workshop/content/252950"
+        try:
+            key = str(ws.resolve())
+        except OSError:
+            key = str(ws)
+        if key in seen or not ws.is_dir():
+            continue
+        seen.add(key)
+        out.append(ws)
+    return out
+
+
 def list_maps(cooked: Path) -> list[dict]:
     maps: list[dict] = []
 
@@ -316,22 +344,21 @@ def list_maps(cooked: Path) -> list[dict]:
             "workshop_id": workshop_id,
         })
 
-    sa = steamapps_from_cooked(cooked)
-    if sa:
-        ws = sa / "workshop/content/252950"
-        if ws.is_dir():
-            for item in sorted(ws.iterdir()):
-                if not item.is_dir():
-                    continue
-                mf = _find_map_file(item)
-                if not mf:
-                    continue
-                title = None
-                for vdf in sorted(item.glob("*.vdf")):
-                    title = _read_vdf_title(vdf)
-                    if title:
-                        break
-                add(title or mf.stem, mf, "workshop", _find_local_preview(item), item.name)
+    seen_workshop: set[str] = set()
+    for ws in _workshop_dirs(cooked):
+        for item in sorted(ws.iterdir()):
+            if not item.is_dir() or item.name in seen_workshop:
+                continue
+            mf = _find_map_file(item)
+            if not mf:
+                continue
+            seen_workshop.add(item.name)
+            title = None
+            for vdf in sorted(item.glob("*.vdf")):
+                title = _read_vdf_title(vdf)
+                if title:
+                    break
+            add(title or mf.stem, mf, "workshop", _find_local_preview(item), item.name)
 
     mods = cooked / "mods"
     if mods.is_dir():

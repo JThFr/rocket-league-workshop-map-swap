@@ -306,6 +306,7 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
                      "workshop_id": local.get("workshop_id"),
                      "slot": local.get("slot"), "arena": local.get("arena")},
             "sha256": local_hash or None,
+            "map_count": len(self_keys),
         },
         "peers": roster,
         "common": common,

@@ -96,8 +96,13 @@ class _CookedFixture(unittest.TestCase):
         (self.cooked / "mods").mkdir(parents=True)
         (self.cooked / SLOT_FILE).write_bytes(b"STOCK")
         (self.cooked / "mods" / "TestMap.upk").write_bytes(b"TESTMAP")
+        # `list_maps` scans Steam libraries for Workshop content; keep the
+        # developer's real install out of the fixtures.
+        self._steam_libs = maps._steam_libraries
+        maps._steam_libraries = lambda: []
 
     def tearDown(self) -> None:
+        maps._steam_libraries = self._steam_libs
         self._tmp.cleanup()
 
 
@@ -1030,6 +1035,24 @@ class MapsTests(_CookedFixture):
         self.assertIn("TestMap", {e["name"] for e in inv})
         self.assertTrue(all("key" in e for e in inv))
 
+    def test_workshop_maps_found_from_another_steam_library(self):
+        # An Epic-cooked install (no steamapps of its own) must still see the
+        # maps the player subscribed to on Steam, wherever that library lives.
+        lib = Path(self._tmp.name) / "SteamLib"
+        item = lib / "steamapps/workshop/content/252950/999"
+        item.mkdir(parents=True)
+        (item / "Map.udk").write_bytes(b"MAP")
+        (item / "x.vdf").write_text('"workshopitem"\n{\n\t"title"\t"My Workshop Map"\n}')
+        saved = maps._steam_libraries
+        maps._steam_libraries = lambda: [lib]
+        try:
+            ws = [m for m in maps.list_maps(self.cooked) if m["source"] == "workshop"]
+        finally:
+            maps._steam_libraries = saved
+        self.assertEqual([(m["workshop_id"], m["name"]) for m in ws],
+                         [("999", "My Workshop Map")])
+        self.assertEqual(maps.map_key(ws[0]), "w:999")
+
 
 class InstallDetectionTests(unittest.TestCase):
     """Steam and Epic Games Store install detection (Steam stays first)."""
@@ -1649,6 +1672,8 @@ class EveryoneFilterTests(unittest.TestCase):
             (cooked / "mods" / "Shared.upk").write_bytes(b"SHARED")
             if extra:
                 (cooked / "mods" / "Only1.upk").write_bytes(b"ONLY1")
+        self._steam_libs = maps._steam_libraries
+        maps._steam_libraries = lambda: []      # ignore the developer's real installs
         self.srv1 = self._serve(self.cooked1)
 
     def _serve(self, cooked):
@@ -1663,6 +1688,7 @@ class EveryoneFilterTests(unittest.TestCase):
     def tearDown(self):
         self.srv1.shutdown()
         self.srv1.server_close()
+        maps._steam_libraries = self._steam_libs
         self._tmp.cleanup()
 
     def test_inventory_and_common(self):

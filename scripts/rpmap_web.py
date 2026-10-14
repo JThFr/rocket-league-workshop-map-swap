@@ -784,10 +784,11 @@ function peerRow(p, isSelf){
   const dot = `<span class="dot ${p.online?'on':'off'}"></span>`;
   const slot = p.slot || {};
   const arena = slot.arena ? ' <span class="muted">\u00b7 ' + esc(slot.arena) + '</span>' : '';
+  const mapsN = p.map_count != null ? ' <span class="muted">\u00b7 ' + p.map_count + ' maps</span>' : '';
   const map = !p.rpmap && !isSelf ? reachLabel(p)
-            : slot.map_name ? esc(slot.map_name) + arena
-            : slot.state==='stock' ? 'Stock map' + arena
-            : slot.state ? esc(slot.state) + arena : '\u2014';
+            : slot.map_name ? esc(slot.map_name) + arena + mapsN
+            : slot.state==='stock' ? 'Stock map' + arena + mapsN
+            : slot.state ? esc(slot.state) + arena + mapsN : '\u2014';
   const size = slot.size ? fmtSize(slot.size) : '';
   const hash = p.sha256 ? `<code>${esc(String(p.sha256).slice(0,10))}</code>` : '';
   let verCell = '';
@@ -848,6 +849,10 @@ async function loadPeers(){
     + (n > reachable ? ' \u00b7 ' + (n - reachable) + ' unreachable' : '');
   if(vdiff) status += ' \u00b7 ' + vdiff + ' on a different rpmap version';
   if(COMMON) status += ' \u00b7 ' + COMMON.length + (n ? ' map(s) everyone has' : ' map(s) (all yours)');
+  const emptyInv = PEERS.filter(p => p.rpmap && p.map_count === 0).length;
+  if(emptyInv) status += ' \u00b7 ' + emptyInv + ' peer(s) found 0 maps';
+  if(COMMON && !COMMON.length && reachable)
+    status += ' \u00b7 nothing in common (check each peer\u2019s map count)';
   document.getElementById('peersStatus').textContent = status;
   render();   // refresh the "everyone has" filter availability/count
 }
