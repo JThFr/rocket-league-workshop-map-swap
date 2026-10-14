@@ -96,8 +96,13 @@ class _CookedFixture(unittest.TestCase):
         (self.cooked / "mods").mkdir(parents=True)
         (self.cooked / SLOT_FILE).write_bytes(b"STOCK")
         (self.cooked / "mods" / "TestMap.upk").write_bytes(b"TESTMAP")
+        # `list_maps` scans Steam libraries for Workshop content; keep the
+        # developer's real install out of the fixtures.
+        self._steam_libs = maps._steam_libraries
+        maps._steam_libraries = lambda: []
 
     def tearDown(self) -> None:
+        maps._steam_libraries = self._steam_libs
         self._tmp.cleanup()
 
 
@@ -423,6 +428,49 @@ class PeerTests(unittest.TestCase):
 
     def test_common_map_keys_ignores_peers_without_inventory(self):
         self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
+
+    def test_sync_same_stock_slot_is_in_sync_despite_different_hashes(self):
+        # Stock Labs_*.upk bytes vary with the game build/platform, so two
+        # players on the same stock arena can hash differently - still in sync.
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "utopia", "state": "stock", "sha256": "bbb"}
+        self.assertEqual(peers._sync_state(local, peer), "same")
+
+    def test_sync_different_slots_are_out_of_sync(self):
+        # Both stock, but Utopia vs Underpass is a different arena.
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "underpass", "state": "stock", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, peer), "different")
+
+    def test_sync_custom_maps_compare_by_hash(self):
+        local = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        same = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        other = {"slot": "utopia", "state": "custom", "sha256": "bbb"}
+        self.assertEqual(peers._sync_state(local, same), "same")
+        self.assertEqual(peers._sync_state(local, other), "different")
+
+    def test_sync_stock_versus_custom_is_different(self):
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, peer), "different")
+
+    def test_sync_unknown_without_a_hash_or_slot(self):
+        local = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, {}), "unknown")
+        self.assertEqual(peers._sync_state(local, {"slot": "utopia", "state": "custom"}),
+                         "unknown")
+
+    def test_peer_row_carries_slot_and_arena(self):
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        got = {"caps": {"name": "friend", "version": "0.8.4"},
+               "state": {"slot": {"slot": "utopia", "state": "stock",
+                                  "arena": "Utopia Retro", "size": 2890819,
+                                  "sha256": "bbb"}}}
+        row = peers._peer_row({"peer_id": "f", "name": "f", "ip": "100.0.0.2",
+                               "online": True}, 8787, got, local)
+        self.assertEqual(row["in_sync"], "same")
+        self.assertEqual(row["slot"]["slot"], "utopia")
+        self.assertEqual(row["slot"]["arena"], "Utopia Retro")
 
 
 class LanRelayTests(unittest.TestCase):
@@ -895,6 +943,24 @@ class SlotTests(_CookedFixture):
         maps.restore_slot(self.cooked, "underpass")
         self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "stock")
 
+    def test_swap_to_a_same_size_map_reports_the_new_hash(self):
+        # The hash cache is keyed on (path, size, mtime). Preserving the old
+        # slot's mtime on a swap used to let a same-size map reuse the previous
+        # file's cache entry and report a stale sha256.
+        stock = _package(34)
+        (self.cooked / SLOT_FILE).write_bytes(stock)
+        maps.slot_state(self.cooked, "underpass")          # warm the cache
+
+        other = _package(0)                                # same length, different bytes
+        self.assertEqual(len(other), len(stock))
+        (self.cooked / "mods" / "Same.upk").write_bytes(other)
+
+        maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "Same.upk")
+        st = maps.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["state"], "custom")
+        self.assertEqual(st["sha256"], maps.file_hash(self.cooked / "mods" / "Same.upk"))
+        self.assertNotEqual(st["sha256"], maps.file_hash(self.cooked / (SLOT_FILE + ".orig")))
+
     def test_use_refuses_custom_slot_without_backup(self):
         (self.cooked / SLOT_FILE).write_bytes(b"TESTMAP")   # matches mods/TestMap.upk
         self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "custom")
@@ -968,6 +1034,24 @@ class MapsTests(_CookedFixture):
         inv = maps.map_inventory(self.cooked)
         self.assertIn("TestMap", {e["name"] for e in inv})
         self.assertTrue(all("key" in e for e in inv))
+
+    def test_workshop_maps_found_from_another_steam_library(self):
+        # An Epic-cooked install (no steamapps of its own) must still see the
+        # maps the player subscribed to on Steam, wherever that library lives.
+        lib = Path(self._tmp.name) / "SteamLib"
+        item = lib / "steamapps/workshop/content/252950/999"
+        item.mkdir(parents=True)
+        (item / "Map.udk").write_bytes(b"MAP")
+        (item / "x.vdf").write_text('"workshopitem"\n{\n\t"title"\t"My Workshop Map"\n}')
+        saved = maps._steam_libraries
+        maps._steam_libraries = lambda: [lib]
+        try:
+            ws = [m for m in maps.list_maps(self.cooked) if m["source"] == "workshop"]
+        finally:
+            maps._steam_libraries = saved
+        self.assertEqual([(m["workshop_id"], m["name"]) for m in ws],
+                         [("999", "My Workshop Map")])
+        self.assertEqual(maps.map_key(ws[0]), "w:999")
 
 
 class InstallDetectionTests(unittest.TestCase):
@@ -1588,6 +1672,8 @@ class EveryoneFilterTests(unittest.TestCase):
             (cooked / "mods" / "Shared.upk").write_bytes(b"SHARED")
             if extra:
                 (cooked / "mods" / "Only1.upk").write_bytes(b"ONLY1")
+        self._steam_libs = maps._steam_libraries
+        maps._steam_libraries = lambda: []      # ignore the developer's real installs
         self.srv1 = self._serve(self.cooked1)
 
     def _serve(self, cooked):
@@ -1602,6 +1688,7 @@ class EveryoneFilterTests(unittest.TestCase):
     def tearDown(self):
         self.srv1.shutdown()
         self.srv1.server_close()
+        maps._steam_libraries = self._steam_libs
         self._tmp.cleanup()
 
     def test_inventory_and_common(self):

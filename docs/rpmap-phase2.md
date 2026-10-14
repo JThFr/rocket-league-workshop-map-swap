@@ -97,7 +97,11 @@ All `/api/*` calls require the shared secret (query param or header) and a valid
 
 ## "In sync" definition
 
-`in sync` = every peer reports the **same slot sha256** as the session's chosen map.
+`in sync` = the peer is on the **same arena** as us. Stock maps are matched by
+**slot** (Utopia/Underpass) — never by raw `sha256`, because the stock
+`Labs_*.upk` bytes vary with the Rocket League build/platform. Custom maps are
+matched by content `sha256` (the same file on both machines). A peer on a
+different slot is a different arena and cannot be byte-compared.
 Display per peer: `same` / `different` / `unknown` (peer unreachable or hash missing).
 
 ## Security
