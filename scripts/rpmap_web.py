@@ -265,9 +265,9 @@ def _lan_start(engine: dict, payload: dict) -> dict:
     if relay and relay.running:
         return {"ok": False, "error": "relay already running", "lan": _lan_status(engine)}
 
-    mode = str(payload.get("mode") or "host")
-    if mode not in ("host", "join"):
-        return {"ok": False, "error": "mode must be 'host' or 'join'"}
+    mode = str(payload.get("mode") or "relay")   # symmetric is the default
+    if mode not in ("host", "join", "relay"):
+        return {"ok": False, "error": "mode must be 'host', 'join' or 'relay'"}
 
     token = engine.get("secret") or ""
     if not token:
@@ -275,7 +275,7 @@ def _lan_start(engine: dict, payload: dict) -> dict:
 
     host = (payload.get("host") or "").strip() or None
     peers = None
-    if mode == "host":
+    if mode in ("host", "relay"):
         peers = rpmap_lan.resolve_peers(engine.get("cfg") or {}, payload.get("peers"))
         if not peers:
             return {"ok": False, "error": "no peers online (need a tailnet peer)"}
@@ -519,8 +519,9 @@ PAGE = r"""<!doctype html>
       <span class="muted" id="lanStatus">checking...</span>
     </div>
     <div class="row" style="margin-top:10px">
-      <label class="muted"><input type="radio" name="lanMode" value="host" checked onchange="renderLan()"> I'm hosting</label>
+      <label class="muted"><input type="radio" name="lanMode" value="host" onchange="renderLan()"> I'm hosting</label>
       <label class="muted"><input type="radio" name="lanMode" value="join" onchange="renderLan()"> I'm joining</label>
+      <label class="muted"><input type="radio" name="lanMode" value="relay" checked onchange="renderLan()"> Everyone (host &amp; join)</label>
       <input class="search" id="lanHost" placeholder="Host's tailnet IP (100.x.y.z)" style="display:none">
       <span class="grow"></span>
       <button class="primary" id="lanStart" onclick="startLan()">Start relay</button>
@@ -897,8 +898,10 @@ function renderLan(){
   const L = LAN || {};
   const st = document.getElementById('lanStatus');
   if(L.running){
-    st.innerHTML = '<span class="badge b-stock">relaying</span> '
-      + (L.mode === 'join' ? 'joining ' + esc(L.host || '?') : 'hosting &rarr; ' + esc(fmtLanPeers(L.peers)));
+    const what = L.mode === 'join' ? 'joining ' + esc(L.host || '?')
+      : L.mode === 'relay' ? 'everyone relays &rarr; ' + esc(fmtLanPeers(L.peers))
+      : 'hosting &rarr; ' + esc(fmtLanPeers(L.peers));
+    st.innerHTML = '<span class="badge b-stock">relaying</span> ' + what;
   } else if(L.error){
     st.innerHTML = '<span class="badge b-unknown">stopped</span> ' + esc(L.error);
   } else {

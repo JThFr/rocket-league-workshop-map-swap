@@ -34,6 +34,7 @@ Usage:
   python3 rpmap.py doctor               # diagnose paths, connection mode, peers, TLS
   python3 rpmap.py lan-host [--peer IP]... # relay native LAN discovery (you host)
   python3 rpmap.py lan-join --host IP   # receive relayed LAN discovery (you join)
+  python3 rpmap.py lan [--peer IP]...   # relay both ways (everyone can host+join)
   python3 rpmap.py version              # print the version
   python3 rpmap.py check-update         # check GitHub for a newer release
 
@@ -165,6 +166,14 @@ def main(argv: list[str] | None = None) -> int:
     p_lj.add_argument("--host", required=True, help="tailnet IP of the host")
     _add_lan_args(p_lj)
 
+    p_lan = sub.add_parser(
+        "lan", help="relay native LAN discovery both ways (everyone can host and join)")
+    p_lan.add_argument("--peer", action="append", default=[],
+                       help="tailnet IP of a peer (repeatable; default: all online peers)")
+    p_lan.add_argument("--advertise",
+                       help="IP written into ServerID (default: your tailscale IP)")
+    _add_lan_args(p_lan)
+
     sub.add_parser("version", help="print the version")
     sub.add_parser("check-update", help="check GitHub for a newer release")
 
@@ -212,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "doctor":
         return rpmap_doctor.run(args.cooked, args.slot)
 
-    if args.cmd in ("lan-host", "lan-join"):
+    if args.cmd in ("lan-host", "lan-join", "lan"):
         cfg = load_config()
         token = (args.token or "").strip() or cfg.get("session_secret") or ""
         if not token:
@@ -225,8 +234,14 @@ def main(argv: list[str] | None = None) -> int:
                 advertise=args.advertise, relay_port=args.relay_port,
                 bind=args.bind, inject_mode=args.inject, lan_port=args.lan_port,
                 dev=args.dev)
-        return rpmap_lan.run_join(
-            host=args.host, token=token, relay_port=args.relay_port,
+        if args.cmd == "lan-join":
+            return rpmap_lan.run_join(
+                host=args.host, token=token, relay_port=args.relay_port,
+                bind=args.bind, inject_mode=args.inject, lan_port=args.lan_port,
+                dev=args.dev)
+        return rpmap_lan.run_relay(
+            peers=rpmap_lan.resolve_peers(cfg, args.peer), token=token,
+            advertise=args.advertise, relay_port=args.relay_port,
             bind=args.bind, inject_mode=args.inject, lan_port=args.lan_port,
             dev=args.dev)
 

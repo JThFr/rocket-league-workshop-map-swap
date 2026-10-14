@@ -7,6 +7,7 @@ Runs with the standard library only:
 
 from __future__ import annotations
 
+import collections
 import http.client
 import ipaddress
 import json
@@ -503,6 +504,256 @@ class LanRelayTests(unittest.TestCase):
         self.assertFalse(seen.fresh(b"abc"))
         self.assertTrue(seen.fresh(b"def"))
 
+    def test_dedupe_keeps_distinct_nonces(self):
+        # RL emits many queries/responses with fresh nonces; the guard must not
+        # mistake them for duplicates (that would silently break a live lobby).
+        seen = lan._Seen()
+        for nonce in range(6):
+            data = _lan_msg("ProjectX.LanMessage_HostQuery_X",
+                            b'{"Nonce":%d}' % (1000 + nonce))
+            self.assertTrue(seen.fresh(data), f"nonce {nonce} wrongly deduped")
+        # ...but an exact replay of any one of them is still dropped.
+        replay = _lan_msg("ProjectX.LanMessage_HostQuery_X", b'{"Nonce":1000}')
+        self.assertFalse(seen.fresh(replay))
+
+    def test_dedupe_ttl_expires(self):
+        seen = lan._Seen(ttl=0.05)
+        self.assertTrue(seen.fresh(b"xyz"))
+        self.assertFalse(seen.fresh(b"xyz"))
+        time.sleep(0.06)
+        self.assertTrue(seen.fresh(b"xyz"))   # expired -> a later retransmit passes
+
+
+class LanStormTests(unittest.TestCase):
+    """Loop-guard under the symmetric "everyone relays" topology.
+
+    The mode the relay is heading for forwards *both* queries and responses and
+    injects whatever arrives, so the dedupe guard becomes load-bearing. This
+    models N nodes using the real framing/classify/rewrite/`_Seen` helpers (no
+    sockets): a node's own injected broadcast loops back into its own capture
+    socket, exactly as a real broadcast does, and must not be re-forwarded.
+    A regression here shows up as an unbounded "storm".
+    """
+
+    TOKEN = "tok"
+
+    class _Node:
+        def __init__(self, name, ip, hosts):
+            self.name, self.ip, self.hosts = name, ip, hosts
+            self.seen = lan._Seen()
+            self.injected = []      # relay types this node injected locally
+            self.forwarded = []     # relay types this node unicast to peers
+            self._nonce = 0
+
+        def response(self):
+            self._nonce += 1
+            return _lan_msg(
+                "ProjectX.LanMessage_HostResponse_X",
+                b'{"ServerID":"%s:7777","Nonce":%d}'
+                % (self.ip.encode(), self._nonce))
+
+    @staticmethod
+    def _msg(cls, nonce):
+        return _lan_msg(cls, b'{"Nonce":%d}' % nonce)
+
+    def _run(self, nodes, seed, max_steps=200):
+        """Drain the bus; returns the step count (the storm meter)."""
+        q = [seed]
+        steps = 0
+        while q:
+            steps += 1
+            self.assertLess(steps, max_steps, "storm: topology did not settle")
+            node_name, kind, payload = q.pop(0)
+            node = nodes[node_name]
+            if kind == "capture":                  # a LAN broadcast on `node`
+                k, _ = lan.classify(payload)
+                if k is None or not node.seen.fresh(payload):
+                    continue
+                if k == "query":
+                    out, typ = payload, lan.TYPE_Q
+                else:
+                    res = lan.rewrite_serverid(payload, node.ip)
+                    if res is None:
+                        continue
+                    out, typ = res[0], lan.TYPE_R
+                node.forwarded.append(typ)
+                for peer in nodes:
+                    if peer != node_name:
+                        q.append((peer, "relay",
+                                  lan.encode(self.TOKEN, typ, out)))
+            else:                                  # a peer's unicast arrived
+                typ, payload = lan.decode(self.TOKEN, payload)
+                if typ is None or not node.seen.fresh(payload):
+                    continue
+                node.injected.append(typ)
+                # the injected broadcast is heard again by THIS node's capture
+                q.append((node_name, "capture", payload))
+                if typ == lan.TYPE_Q and node.hosts:
+                    q.append((node_name, "capture", node.response()))
+        return steps
+
+    def test_two_nodes_mutual_host_does_not_storm(self):
+        a = self._Node("A", "100.0.0.1", hosts=True)
+        b = self._Node("B", "100.0.0.2", hosts=True)
+        steps = self._run({"A": a, "B": b},
+                          ("A", "capture",
+                           self._msg("ProjectX.LanMessage_HostQuery_X", 1)))
+        self.assertEqual(a.forwarded, [lan.TYPE_Q])   # A forwarded the query once
+        self.assertEqual(b.forwarded, [lan.TYPE_R])   # B forwarded its response once
+        self.assertEqual(b.injected, [lan.TYPE_Q])    # B injected the query...
+        self.assertEqual(a.injected, [lan.TYPE_R])    # ...and A injected B's response
+        # the injected query must not loop: A captured nothing it re-forwarded
+        self.assertNotIn(lan.TYPE_Q, b.forwarded)
+        self.assertLess(steps, 20)
+
+    def test_three_nodes_all_host_no_storm(self):
+        nodes = {n: self._Node(n, f"100.0.0.{i + 1}", hosts=True)
+                 for i, n in enumerate("ABC")}
+        steps = self._run(nodes,
+                          ("A", "capture",
+                           self._msg("ProjectX.LanMessage_HostQuery_X", 7)))
+        # A's query reached B and C, each answered, and each response reached
+        # the other two -- a full mesh of one hop, and then it settled.
+        self.assertEqual(nodes["A"].forwarded, [lan.TYPE_Q])
+        self.assertEqual(nodes["B"].forwarded, [lan.TYPE_R])
+        self.assertEqual(nodes["C"].forwarded, [lan.TYPE_R])
+        for name in "BC":
+            self.assertIn(lan.TYPE_Q, nodes[name].injected)
+        self.assertEqual(len(nodes["A"].injected), 2)      # B's + C's responses
+        self.assertLess(steps, 40)
+        # no node should have forwarded more than it captured
+        for node in nodes.values():
+            self.assertLessEqual(len(node.forwarded), len(node.injected) + 1)
+
+
+class _FakeSock:
+    """A UDP socket stand-in: an inbox to read, a log of what was sent."""
+
+    def __init__(self):
+        self.inbox = []
+        self.sent = []
+
+    def recvfrom(self, n=65535):
+        return self.inbox.pop(0)
+
+    def sendto(self, data, dest):
+        self.sent.append((data, dest))
+
+    def close(self):
+        pass
+
+
+class _FakeSelectModule:
+    """Only the ``select`` attribute rpmap_lan uses."""
+
+    def __init__(self, select_fn):
+        self.select = select_fn
+
+
+class LanSymmetricRunTests(unittest.TestCase):
+    """`run_relay` (symmetric mode) driven over fake sockets.
+
+    This exercises the real loop, not a model: a captured datagram is forwarded,
+    a relay-sourced datagram is injected, and - the load-bearing bit - the
+    injected broadcast, heard again by this node's own capture socket, is NOT
+    re-forwarded (or the mesh would storm).
+    """
+
+    QUERY = LanRelayTests.QUERY
+    RESPONSE = LanRelayTests.RESPONSE
+    TOKEN = "tok"
+    ADV = "100.64.0.1"      # in the tailnet (100.64.0.0/10)
+    PEER = "100.64.0.2"
+
+    def _drive(self, events, *, advertise=ADV, peers=(PEER,)):
+        """Run run_relay over a scripted, deterministic packet order.
+
+        `events` is a list of ``("cap"|"relay", data, src_addr)``. Injections
+        feed back into the capture socket automatically, modelling the local
+        broadcast loop.
+        """
+        cap, relay, inj = _FakeSock(), _FakeSock(), _FakeSock()
+        socks = {"cap": cap, "relay": relay}
+        script = collections.deque((socks[w], data, addr) for w, data, addr in events)
+        stop = threading.Event()
+
+        def fake_select(r, w, x, timeout=None):
+            if script:
+                sock, data, addr = script.popleft()
+                sock.inbox.append((data, addr))
+                return [sock], [], []
+            stop.set()
+            return [], [], []
+
+        def inj_sendto(data, dest):
+            inj.sent.append((data, dest))
+            script.append((cap, data, ("127.0.0.1", lan.LAN_PORT)))
+
+        inj.sendto = inj_sendto
+        saved = (lan.make_capture_socket, lan.make_relay_socket,
+                 lan.make_inject_socket, lan.select, lan.local_advertise)
+        lan.make_capture_socket = lambda lan_port=lan.LAN_PORT: cap
+        lan.make_relay_socket = lambda port, bind: relay
+        lan.make_inject_socket = lambda: inj
+        lan.select = _FakeSelectModule(fake_select)
+        lan.local_advertise = lambda: advertise
+        try:
+            lan.run_relay(peers=list(peers), token=self.TOKEN, advertise=advertise,
+                          stop_event=stop, log=lambda *a, **k: None)
+        finally:
+            (lan.make_capture_socket, lan.make_relay_socket,
+             lan.make_inject_socket, lan.select, lan.local_advertise) = saved
+        return cap, relay, inj
+
+    def test_captured_query_is_forwarded_verbatim(self):
+        cap, relay, inj = self._drive(
+            [("cap", self.QUERY, ("100.64.0.1", lan.LAN_PORT))])
+        self.assertEqual(len(relay.sent), 1)
+        data, dest = relay.sent[0]
+        self.assertEqual(dest, (self.PEER, lan.DEFAULT_RELAY_PORT))
+        self.assertEqual(lan.decode(self.TOKEN, data), (lan.TYPE_Q, self.QUERY))
+        self.assertEqual(inj.sent, [])
+
+    def test_captured_response_is_rewritten_to_own_ip(self):
+        cap, relay, inj = self._drive(
+            [("cap", self.RESPONSE, ("100.64.0.1", lan.LAN_PORT))])
+        typ, payload = lan.decode(self.TOKEN, relay.sent[0][0])
+        self.assertEqual(typ, lan.TYPE_R)
+        self.assertIn(f'"ServerID":"{self.ADV}:7777"'.encode(), payload)
+        self.assertNotIn(b"192.168.1.16", payload)
+
+    def test_relay_query_is_injected_and_not_re_forwarded(self):
+        # A peer's query arrives; we inject it, and our own capture hears the
+        # injected broadcast again - the guard must stop it being forwarded.
+        pkt = lan.encode(self.TOKEN, lan.TYPE_Q, self.QUERY)
+        cap, relay, inj = self._drive(
+            [("relay", pkt, (self.PEER, lan.DEFAULT_RELAY_PORT))])
+        # injected once, as the raw (unframed) query payload
+        self.assertEqual([lan.classify(d)[0] for d, _ in inj.sent], ["query"])
+        self.assertEqual(relay.sent, [])                           # never forwarded
+        self.assertEqual(cap.sent, [])
+
+    def test_relay_response_is_injected_and_not_re_forwarded(self):
+        pkt = lan.encode(self.TOKEN, lan.TYPE_R, self.RESPONSE)
+        cap, relay, inj = self._drive(
+            [("relay", pkt, (self.PEER, lan.DEFAULT_RELAY_PORT))])
+        self.assertEqual([lan.classify(d)[0] for d, _ in inj.sent], ["response"])
+        self.assertEqual(relay.sent, [])
+
+    def test_duplicate_relay_packet_is_dropped(self):
+        pkt = lan.encode(self.TOKEN, lan.TYPE_Q, self.QUERY)
+        addr = (self.PEER, lan.DEFAULT_RELAY_PORT)
+        cap, relay, inj = self._drive([("relay", pkt, addr), ("relay", pkt, addr)])
+        self.assertEqual(len(inj.sent), 1)     # exact repeat within TTL dropped
+        self.assertEqual(relay.sent, [])
+
+    def test_non_tailnet_source_is_dropped(self):
+        pkt = lan.encode(self.TOKEN, lan.TYPE_Q, self.QUERY)
+        cap, relay, inj = self._drive(
+            [("relay", pkt, ("8.8.8.8", lan.DEFAULT_RELAY_PORT))])
+        self.assertEqual(inj.sent, [])
+        self.assertEqual(relay.sent, [])
+
 
 class LanRelayControllerTests(unittest.TestCase):
     """The threaded `Relay` controller (the web UI drives this)."""
@@ -530,6 +781,30 @@ class LanRelayControllerTests(unittest.TestCase):
             self.assertFalse(relay.running)
         finally:
             lan.run_host = orig
+
+    def test_relay_mode_dispatches_to_run_relay(self):
+        orig = lan.run_relay
+        called = {}
+
+        def fake_run(*, peers, token, stop_event=None, **kw):
+            called["peers"] = peers
+            while not stop_event.is_set():
+                time.sleep(0.01)
+            return 0
+
+        lan.run_relay = fake_run
+        try:
+            relay = lan.Relay(mode="relay", token="t", peers=["100.0.0.2"],
+                              advertise="100.0.0.1")
+            self.assertTrue(relay.start())
+            for _ in range(100):
+                if called:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(called.get("peers"), ["100.0.0.2"])
+            self.assertTrue(relay.stop())
+        finally:
+            lan.run_relay = orig
 
     def test_setup_error_is_captured_not_raised(self):
         orig = lan.run_join
@@ -935,6 +1210,9 @@ class HttpTests(_CookedFixture):
         self.assertIn(b"LAN discovery relay", body)
         self.assertIn(b"startLan(", body)
         self.assertIn(b"stopLan(", body)
+        self.assertIn(b'value="relay" checked', body)   # symmetric is the default
+        self.assertNotIn(b'value="host" checked', body)
+        self.assertIn(b"Everyone (host", body)
 
     def test_lan_join_needs_a_host(self):
         status, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
@@ -975,6 +1253,51 @@ class HttpTests(_CookedFixture):
         self.assertTrue(json.loads(body)["ok"])
         _, body = self._req("GET", "/api/lan?token=" + self.TOKEN)
         self.assertFalse(json.loads(body)["running"])
+
+    def test_lan_relay_without_peers_is_refused(self):
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: []
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "relay"})
+        finally:
+            lan.resolve_peers = orig
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("peer", json.loads(body)["error"])
+
+    def test_lan_relay_start_roundtrip(self):
+        self.engine["relay_factory"] = _FakeRelay
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: ["100.64.0.7"]
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                                body={"mode": "relay"})
+            started = json.loads(body)
+            self.assertTrue(started["ok"], body)
+            self.assertEqual(started["lan"]["mode"], "relay")
+            self.assertEqual(started["lan"]["peers"], ["100.64.0.7"])
+        finally:
+            lan.resolve_peers = orig
+        self._req("POST", "/api/lan/stop?token=" + self.TOKEN)
+
+    def test_lan_start_defaults_to_symmetric(self):
+        self.engine["relay_factory"] = _FakeRelay
+        orig = lan.resolve_peers
+        lan.resolve_peers = lambda cfg, explicit=None: ["100.64.0.7"]
+        try:
+            _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN, body={})
+            started = json.loads(body)
+            self.assertTrue(started["ok"], body)
+            self.assertEqual(started["lan"]["mode"], "relay")
+        finally:
+            lan.resolve_peers = orig
+        self._req("POST", "/api/lan/stop?token=" + self.TOKEN)
+
+    def test_lan_start_rejects_an_unknown_mode(self):
+        _, body = self._req("POST", "/api/lan/start?token=" + self.TOKEN,
+                            body={"mode": "bogus"})
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("mode", json.loads(body)["error"])
 
     def test_network_endpoint_reports_the_mode(self):
         status, body = self._req("GET", "/api/network?token=" + self.TOKEN)
