@@ -783,10 +783,11 @@ function reachLabel(p){
 function peerRow(p, isSelf){
   const dot = `<span class="dot ${p.online?'on':'off'}"></span>`;
   const slot = p.slot || {};
+  const arena = slot.arena ? ' <span class="muted">\u00b7 ' + esc(slot.arena) + '</span>' : '';
   const map = !p.rpmap && !isSelf ? reachLabel(p)
-            : slot.map_name ? esc(slot.map_name)
-            : slot.state==='stock' ? 'Stock map'
-            : slot.state ? esc(slot.state) : '\u2014';
+            : slot.map_name ? esc(slot.map_name) + arena
+            : slot.state==='stock' ? 'Stock map' + arena
+            : slot.state ? esc(slot.state) + arena : '\u2014';
   const size = slot.size ? fmtSize(slot.size) : '';
   const hash = p.sha256 ? `<code>${esc(String(p.sha256).slice(0,10))}</code>` : '';
   let verCell = '';

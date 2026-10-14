@@ -424,6 +424,49 @@ class PeerTests(unittest.TestCase):
     def test_common_map_keys_ignores_peers_without_inventory(self):
         self.assertEqual(peers.common_map_keys([{"a"}, None]), ["a"])
 
+    def test_sync_same_stock_slot_is_in_sync_despite_different_hashes(self):
+        # Stock Labs_*.upk bytes vary with the game build/platform, so two
+        # players on the same stock arena can hash differently - still in sync.
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "utopia", "state": "stock", "sha256": "bbb"}
+        self.assertEqual(peers._sync_state(local, peer), "same")
+
+    def test_sync_different_slots_are_out_of_sync(self):
+        # Both stock, but Utopia vs Underpass is a different arena.
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "underpass", "state": "stock", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, peer), "different")
+
+    def test_sync_custom_maps_compare_by_hash(self):
+        local = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        same = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        other = {"slot": "utopia", "state": "custom", "sha256": "bbb"}
+        self.assertEqual(peers._sync_state(local, same), "same")
+        self.assertEqual(peers._sync_state(local, other), "different")
+
+    def test_sync_stock_versus_custom_is_different(self):
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        peer = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, peer), "different")
+
+    def test_sync_unknown_without_a_hash_or_slot(self):
+        local = {"slot": "utopia", "state": "custom", "sha256": "aaa"}
+        self.assertEqual(peers._sync_state(local, {}), "unknown")
+        self.assertEqual(peers._sync_state(local, {"slot": "utopia", "state": "custom"}),
+                         "unknown")
+
+    def test_peer_row_carries_slot_and_arena(self):
+        local = {"slot": "utopia", "state": "stock", "sha256": "aaa"}
+        got = {"caps": {"name": "friend", "version": "0.8.4"},
+               "state": {"slot": {"slot": "utopia", "state": "stock",
+                                  "arena": "Utopia Retro", "size": 2890819,
+                                  "sha256": "bbb"}}}
+        row = peers._peer_row({"peer_id": "f", "name": "f", "ip": "100.0.0.2",
+                               "online": True}, 8787, got, local)
+        self.assertEqual(row["in_sync"], "same")
+        self.assertEqual(row["slot"]["slot"], "utopia")
+        self.assertEqual(row["slot"]["arena"], "Utopia Retro")
+
 
 class LanRelayTests(unittest.TestCase):
     """The native LAN discovery relay core."""
@@ -894,6 +937,24 @@ class SlotTests(_CookedFixture):
 
         maps.restore_slot(self.cooked, "underpass")
         self.assertEqual(maps.slot_state(self.cooked, "underpass")["state"], "stock")
+
+    def test_swap_to_a_same_size_map_reports_the_new_hash(self):
+        # The hash cache is keyed on (path, size, mtime). Preserving the old
+        # slot's mtime on a swap used to let a same-size map reuse the previous
+        # file's cache entry and report a stale sha256.
+        stock = _package(34)
+        (self.cooked / SLOT_FILE).write_bytes(stock)
+        maps.slot_state(self.cooked, "underpass")          # warm the cache
+
+        other = _package(0)                                # same length, different bytes
+        self.assertEqual(len(other), len(stock))
+        (self.cooked / "mods" / "Same.upk").write_bytes(other)
+
+        maps.use_map(self.cooked, "underpass", self.cooked / "mods" / "Same.upk")
+        st = maps.slot_state(self.cooked, "underpass")
+        self.assertEqual(st["state"], "custom")
+        self.assertEqual(st["sha256"], maps.file_hash(self.cooked / "mods" / "Same.upk"))
+        self.assertNotEqual(st["sha256"], maps.file_hash(self.cooked / (SLOT_FILE + ".orig")))
 
     def test_use_refuses_custom_slot_without_backup(self):
         (self.cooked / SLOT_FILE).write_bytes(b"TESTMAP")   # matches mods/TestMap.upk

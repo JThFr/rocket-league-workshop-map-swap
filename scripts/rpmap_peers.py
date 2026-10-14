@@ -201,7 +201,34 @@ def common_map_keys(key_sets: list[set[str] | None]) -> list[str] | None:
     return sorted(set.intersection(*sets))
 
 
-def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> dict:
+def _sync_state(local: dict, peer: dict) -> str:
+    """Whether a peer's loaded slot matches ours: ``same`` / ``different`` / ``unknown``.
+
+    Stock maps are compared by **slot**, never by raw ``sha256``: the stock
+    ``Labs_*.upk`` bytes change with the Rocket League build and can differ by
+    platform, so two players on the *same* stock arena can legitimately hash
+    differently (and the comparison reported a false "out of sync"). A peer on a
+    different slot is a different arena and cannot be byte-compared at all.
+    Only custom maps - the same Workshop file on both machines - are compared by
+    content hash.
+    """
+    if not peer:
+        return "unknown"
+    lslot, pslot = local.get("slot"), peer.get("slot")
+    if lslot and pslot and lslot != pslot:
+        return "different"           # different arena (utopia vs underpass)
+    lstate, pstate = local.get("state"), peer.get("state")
+    if lstate == "stock" and pstate == "stock":
+        return "same"                # same stock arena; the bytes aren't comparable
+    if "stock" in (lstate, pstate):
+        return "different"           # one is stock, the other a swapped-in map
+    lh, ph = local.get("sha256") or "", peer.get("sha256") or ""
+    if lh and ph:
+        return "same" if lh == ph else "different"
+    return "unknown"
+
+
+def _peer_row(p: dict, default_port: int, got: dict | None, local: dict) -> dict:
     pport = int(p.get("port") or default_port)
     row = {
         "peer_id": p.get("peer_id"), "name": p.get("name"), "ip": p.get("ip"),
@@ -221,11 +248,11 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local_hash: str) -> 
         "name": (got.get("caps") or {}).get("name") or row["name"],
         "version": (got.get("caps") or {}).get("version"),
         "slot": {"state": st.get("state"), "map_name": st.get("map_name"),
-                 "size": st.get("size"), "workshop_id": st.get("workshop_id")},
+                 "size": st.get("size"), "workshop_id": st.get("workshop_id"),
+                 "slot": st.get("slot"), "arena": st.get("arena")},
         "sha256": sha or None,
     })
-    if local_hash and sha:
-        row["in_sync"] = "same" if sha == local_hash else "different"
+    row["in_sync"] = _sync_state(local, st)
     return row
 
 
@@ -249,7 +276,7 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
                     got = fut.result()
                 except Exception:
                     got = None
-                row = _peer_row(futs[fut], port, got, local_hash)
+                row = _peer_row(futs[fut], port, got, local)
                 row["_keys"] = ({e["key"] for e in got["maps"] if e.get("key")}
                                 if got and got.get("maps") is not None else None)
                 roster.append(row)
@@ -276,7 +303,8 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
             "version": APP_VERSION,
             "slot": {"state": local.get("state"), "map_name": local.get("map_name"),
                      "size": local.get("size"), "sha256": local_hash or None,
-                     "workshop_id": local.get("workshop_id")},
+                     "workshop_id": local.get("workshop_id"),
+                     "slot": local.get("slot"), "arena": local.get("arena")},
             "sha256": local_hash or None,
         },
         "peers": roster,

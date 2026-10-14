@@ -153,7 +153,9 @@ def file_hash(path: Path) -> str:
         st = path.stat()
     except OSError:
         return ""
-    key = (str(path), st.st_size, int(st.st_mtime))
+    # st_mtime_ns (not whole seconds) keeps the cache key distinct across rapid
+    # swaps to a same-size map; a swap must never surface a stale hash.
+    key = (str(path), st.st_size, st.st_mtime_ns)
     if key in _hash_cache:
         return _hash_cache[key]
     h = hashlib.sha256()
@@ -518,7 +520,10 @@ def use_map(cooked: Path, slot: str, src: Path) -> dict:
     tmp = slot_file.with_suffix(slot_file.suffix + ".new")
     shutil.copyfile(src, tmp)
     try:
-        shutil.copystat(slot_file, tmp)
+        # Preserve the slot file's permissions, but deliberately NOT its mtime:
+        # keeping the old timestamp (shutil.copystat) let a same-size map reuse
+        # the previous file's cache entry and report a stale sha256.
+        shutil.copymode(slot_file, tmp)
     except OSError:
         pass
     os.replace(tmp, slot_file)  # atomic on the same filesystem
