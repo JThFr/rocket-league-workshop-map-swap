@@ -8,6 +8,7 @@ import json
 import shutil
 import socket
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -188,6 +189,44 @@ def probe_peer(ip: str | None, port: int, secret: str, timeout: float = 2.0) -> 
     return {"caps": caps, "state": state, "maps": maps}
 
 
+# This machine's own average round-trip time to its reachable peers, refreshed
+# by :func:`gather_peers` and shared with peers via ``/api/capabilities`` (so a
+# peer can tell whose average is lowest and mark the recommended host).
+_self_ping_avg: float | None = None
+
+
+def local_ping_avg() -> float | None:
+    """This machine's last average ping to its peers, in ms (None until measured)."""
+    return _self_ping_avg
+
+
+def ping_peer(ip: str | None, port: int, secret: str,
+              samples: int = 3, timeout: float = 2.0) -> float | None:
+    """Average round-trip time to a peer's lightweight ``/api/ping``, in ms.
+
+    HTTP RTT is a portable stand-in for ICMP: it needs no privileges, works in
+    Tailscale *and* local-network modes, and travels the same path the peer API
+    (and, in practice, the game) uses. Returns None if the peer is unreachable.
+    """
+    if not ip:
+        return None
+    url = f"http://{ip}:{port}/api/ping"
+    vals: list[float] = []
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        try:
+            _http_get_json_auth(url, secret, timeout)
+        except Exception:
+            return None
+        vals.append((time.perf_counter() - t0) * 1000.0)
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _probe_and_ping(ip: str | None, port: int, secret: str) -> tuple[dict | None, float | None]:
+    got = probe_peer(ip, port, secret)
+    return got, (ping_peer(ip, port, secret) if got else None)
+
+
 def common_map_keys(key_sets: list[set[str] | None]) -> list[str] | None:
     """Map keys present in every given set (peers we could actually query).
 
@@ -235,7 +274,8 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local: dict) -> dict
         "online": bool(p.get("online")), "rpmap": False, "port": pport,
         "manual": bool(p.get("manual")),
         "slot": None, "sha256": None, "in_sync": "unknown", "version": None,
-        "map_count": None,
+        "map_count": None, "ping_ms": None, "peer_avg_ms": None,
+        "recommended": False,
         # Why we couldn't reach it (kept meaningful for reachable rows too).
         "reach": "offline" if not p.get("online") else "not-rpmap",
     }
@@ -251,13 +291,39 @@ def _peer_row(p: dict, default_port: int, got: dict | None, local: dict) -> dict
                  "size": st.get("size"), "workshop_id": st.get("workshop_id"),
                  "slot": st.get("slot"), "arena": st.get("arena")},
         "sha256": sha or None,
+        # The peer's *own* average ping, shared via /api/capabilities.
+        "peer_avg_ms": (got.get("caps") or {}).get("ping_ms"),
     })
     row["in_sync"] = _sync_state(local, st)
     return row
 
 
+def _recommended_host(self_key: str, self_avg: float | None,
+                      rows: list[dict]) -> str | None:
+    """The node key whose *shared* average ping is lowest, or None.
+
+    Compares this machine's own average with each reachable peer's self-reported
+    average (``peer_avg_ms``). Needs at least two candidates, so a lone machine
+    is never "recommended" - there is nothing to compare against.
+    """
+    averages: list[tuple[str, float]] = []
+    if self_avg is not None:
+        averages.append((self_key, self_avg))
+    for r in rows:
+        if r.get("rpmap") and r.get("peer_avg_ms") is not None:
+            key = r.get("peer_id") or r.get("name") or r.get("ip") or "?"
+            averages.append((key, float(r["peer_avg_ms"])))
+    return min(averages, key=lambda kv: kv[1])[0] if len(averages) >= 2 else None
+
+
 def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
-    """Probe every peer in parallel and build the roster for this machine."""
+    """Probe every peer in parallel and build the roster for this machine.
+
+    Also measures the round-trip time to each reachable peer, averages this
+    machine's own pings (shared with peers so they can spot the lowest), and
+    flags the node with the lowest average as the recommended host.
+    """
+    global _self_ping_avg
     secret = cfg.get("session_secret") or ""
     port = int(cfg.get("port") or DEFAULT_PORT)
     local = slot_state(cooked, slot)
@@ -270,13 +336,14 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
             futs = {}
             for p in peers:
                 pport = int(p.get("port") or port)
-                futs[ex.submit(probe_peer, p.get("ip"), pport, secret)] = p
+                futs[ex.submit(_probe_and_ping, p.get("ip"), pport, secret)] = p
             for fut in concurrent.futures.as_completed(futs):
                 try:
-                    got = fut.result()
+                    got, ping = fut.result()
                 except Exception:
-                    got = None
+                    got, ping = None, None
                 row = _peer_row(futs[fut], port, got, local)
+                row["ping_ms"] = ping
                 row["_keys"] = ({e["key"] for e in got["maps"] if e.get("key")}
                                 if got and got.get("maps") is not None else None)
                 roster.append(row)
@@ -296,6 +363,18 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
         r.pop("_keys", None)
     roster.sort(key=lambda r: (r.get("name") or ""))
 
+    # Our own average ping, and the recommended host: the node whose *shared*
+    # average is lowest (needs at least two candidates to be a comparison).
+    measured = [r["ping_ms"] for r in roster
+                if r.get("rpmap") and r.get("ping_ms") is not None]
+    _self_ping_avg = round(sum(measured) / len(measured), 1) if measured else None
+
+    self_key = ident.get("peer_id") or "self"
+    recommended = _recommended_host(self_key, _self_ping_avg, roster)
+    for r in roster:
+        r["recommended"] = bool(recommended) and \
+            (r.get("peer_id") or r.get("name") or r.get("ip")) == recommended
+
     return {
         "self": {
             "peer_id": ident.get("peer_id"), "name": ident.get("name"),
@@ -307,6 +386,8 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
                      "slot": local.get("slot"), "arena": local.get("arena")},
             "sha256": local_hash or None,
             "map_count": len(self_keys),
+            "ping_ms": _self_ping_avg,
+            "recommended": bool(recommended) and recommended == self_key,
         },
         "peers": roster,
         "common": common,

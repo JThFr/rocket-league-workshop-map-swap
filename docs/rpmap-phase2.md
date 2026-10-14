@@ -83,9 +83,10 @@ While a group is connected over Tailscale, each `rpmap.py` instance should be ab
 _As originally designed (transfer in **italics** is not implemented):_
 
 ```
-GET  /api/capabilities        -> {product, version, peer_id, name, port, slot:{..., sha256, workshop_id}}
+GET  /api/capabilities        -> {product, version, peer_id, name, port, slot:{..., sha256, workshop_id}, ping_ms}
 GET  /api/state               -> {peer, slot:{..., sha256, workshop_id}}
 GET  /api/peers               -> {self:{...}, peers:[{peer_id, name, ip, online, rpmap?, slot?, sha256?, in_sync?}]}
+GET  /api/ping                -> {ok:true}   (cheap latency target for peers to time)
 GET  /api/session             -> {peer_id, name, port, secret}
 POST /api/peer/switch         -> {workshop_id?, name?, sha256?}   (resolve locally, verify, swap)
 POST /api/sync                -> {mode:"push"|"pull", peers:[{ip,port,name}]}

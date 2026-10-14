@@ -472,6 +472,25 @@ class PeerTests(unittest.TestCase):
         self.assertEqual(row["slot"]["slot"], "utopia")
         self.assertEqual(row["slot"]["arena"], "Utopia Retro")
 
+    def test_recommended_host_is_the_lowest_shared_average(self):
+        rows = [{"peer_id": "b", "rpmap": True, "peer_avg_ms": 40.0},
+                {"peer_id": "c", "rpmap": True, "peer_avg_ms": 90.0}]
+        self.assertEqual(peers._recommended_host("me", 60.0, rows), "b")
+
+    def test_recommended_host_can_be_ourselves(self):
+        rows = [{"peer_id": "b", "rpmap": True, "peer_avg_ms": 80.0}]
+        self.assertEqual(peers._recommended_host("me", 20.0, rows), "me")
+
+    def test_recommended_host_needs_two_candidates(self):
+        self.assertIsNone(peers._recommended_host("me", 20.0, []))
+        self.assertIsNone(peers._recommended_host(
+            "me", None, [{"peer_id": "b", "rpmap": True, "peer_avg_ms": 5.0}]))
+
+    def test_recommended_host_ignores_unreachable_and_unmeasured(self):
+        rows = [{"peer_id": "b", "rpmap": False, "peer_avg_ms": 1.0},
+                {"peer_id": "c", "rpmap": True, "peer_avg_ms": None}]
+        self.assertIsNone(peers._recommended_host("me", 50.0, rows))
+
 
 class LanRelayTests(unittest.TestCase):
     """The native LAN discovery relay core."""
@@ -1199,6 +1218,21 @@ class HttpTests(_CookedFixture):
         self.assertIn("TestMap", {e["name"] for e in inv})
         self.assertTrue(all("key" in e for e in inv))
 
+    def test_api_ping_is_a_cheap_ok(self):
+        status, body = self._req("GET", "/api/ping?token=" + self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(self._req("GET", "/api/ping")[0], 403)   # still authed
+
+    def test_capabilities_shares_our_average_ping(self):
+        peers._self_ping_avg = 42.5
+        try:
+            status, body = self._req("GET", "/api/capabilities?token=" + self.TOKEN)
+        finally:
+            peers._self_ping_avg = None
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["ping_ms"], 42.5)
+
     def test_state_maps_carry_a_key(self):
         _, body = self._req("GET", "/api/state?token=" + self.TOKEN)
         self.assertTrue(all("key" in m for m in json.loads(body)["maps"]))
@@ -1689,6 +1723,7 @@ class EveryoneFilterTests(unittest.TestCase):
         self.srv1.shutdown()
         self.srv1.server_close()
         maps._steam_libraries = self._steam_libs
+        peers._self_ping_avg = None      # don't leak the measured average between tests
         self._tmp.cleanup()
 
     def test_inventory_and_common(self):
@@ -1716,6 +1751,29 @@ class EveryoneFilterTests(unittest.TestCase):
         self.assertEqual(data["peers"][0]["reach"], "ok")
         local_keys = {maps.map_key(m) for m in maps.list_maps(self.cooked2)}
         self.assertEqual(local_keys & set(data["common"]), {"n:shared:6"})
+
+    def test_ping_is_measured_and_shared(self):
+        p1 = self.srv1.server_address[1]
+        ms = peers.ping_peer("127.0.0.1", p1, "s3cr3t")
+        self.assertIsNotNone(ms)
+        self.assertGreaterEqual(ms, 0.0)
+
+        orig = peers.tailscale_peers
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": "m1", "name": "m1", "dns": "", "ip": "127.0.0.1",
+             "port": p1, "online": True, "os": "linux"}]
+        try:
+            data = peers.gather_peers(self.cooked2, "underpass",
+                                      {"session_secret": "s3cr3t"}, {"peer_id": "me"})
+        finally:
+            peers.tailscale_peers = orig
+
+        row = data["peers"][0]
+        self.assertIsNotNone(row["ping_ms"])              # our RTT to the peer
+        self.assertIsNotNone(data["self"]["ping_ms"])     # our own average
+        # The peer shares its average via /api/capabilities (None until it has run
+        # gather_peers itself, so the recommendation needs two measured nodes).
+        self.assertIn("peer_avg_ms", row)
 
     def test_everyone_includes_this_machine_when_alone(self):
         """With no peers the filter is still usable: 'everyone' is just us."""
