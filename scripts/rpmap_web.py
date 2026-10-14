@@ -188,6 +188,57 @@ def _update_apply(engine: dict) -> dict:
             "version": info.get("version")}
 
 
+def _whats_new_status(engine: dict, latest: bool = False) -> dict:
+    """Release notes between the last run's version and the running one.
+
+    ``latest`` (the Updates-panel link) ignores the last-run version and returns
+    the newest release's notes. Only packaged builds - the ones that can
+    actually be updated - show this; the notes are fetched lazily and cached for
+    the run. A fetch failure sets ``error`` so the UI can link out instead.
+
+    The automatic popup is announced **once per run** - ``show`` is true on the
+    first call after an update and false afterwards - so an update-mode change
+    (or a page reload) doesn't pop it up again; the manual reopen uses
+    ``latest`` and always reports the notes.
+    """
+    packaged = update._update_target() is not None
+    prev = engine.get("prev_version")
+    status = {
+        "current": APP_VERSION,
+        "from": prev,                           # last-seen version (None = first run)
+        "to": APP_VERSION,
+        "packaged": packaged,
+        "releases_url": GITHUB_RELEASES_PAGE,
+        "entries": [],
+        "error": None,
+        "show": packaged and (True if latest else bool(prev)),
+    }
+    if not packaged:
+        return status                       # source checkouts never announce updates
+
+    key = "whats_new_latest" if latest else "whats_new"
+    cached = engine.get(key)
+    if cached is None:
+        if latest:
+            entry = update.latest_release_notes()
+            entries = [entry] if entry else None
+        elif prev:
+            entries = update.release_notes(prev, APP_VERSION)
+        else:
+            entries = []                    # first run: nothing to compare against
+        if entries is None:                 # couldn't reach GitHub
+            status["error"] = "couldn't reach GitHub for the release notes"
+            return status                   # don't cache a transient failure
+        cached = engine[key] = {"entries": entries}
+    status["entries"] = cached["entries"]
+    if not latest:
+        # Announce once: only the first request after an update reports show.
+        status["show"] = status["show"] and not engine.get("whats_new_consumed")
+        if status["show"]:
+            engine["whats_new_consumed"] = True
+    return status
+
+
 # --------------------------------------------------------------------------- #
 # LAN discovery relay (started/stopped from the UI; one per machine)
 # --------------------------------------------------------------------------- #
@@ -416,6 +467,7 @@ PAGE = r"""<!doctype html>
       <a id="releaseLink" style="display:none;color:#79c0ff" target="_blank"
          rel="noopener noreferrer">View release &#8599;</a>
       <button id="updateNowBtn" class="primary" style="display:none" onclick="applyUpdate()">Update now</button>
+      <button id="whatsNewBtn" style="display:none" onclick="openWhatsNew(true)">What&#39;s new</button>
       <button onclick="checkUpdates()">Check for updates</button>
     </div>
     <div class="row" id="autoUpdateRow" style="margin-top:10px">
@@ -553,6 +605,19 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 </div>
+
+<div class="modal-back" id="whatsNewModal" style="display:none">
+  <div class="modal">
+    <h2 id="whatsNewTitle">What&#39;s new</h2>
+    <div class="muted" id="whatsNewIntro" style="margin:6px 0 0"></div>
+    <div id="whatsNewBody" style="margin-top:12px;max-height:52vh;overflow:auto"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:14px">
+      <a id="whatsNewLink" target="_blank" rel="noopener noreferrer"
+         style="color:#79c0ff;align-self:center;margin-right:auto">All releases &#8599;</a>
+      <button class="primary" onclick="closeWhatsNew()">Got it</button>
+    </div>
+  </div>
+</div>
 <script>
 let STATE = null;
 let TIMERS = [];        // poll intervals, cleared when the user quits
@@ -561,6 +626,7 @@ let ARENA = 'the arena';
 let ARENA_NOTE = '';
 let NETWORK = null;     // {mode, tailscale_available, tailnet_ip, lan_ip, ...}
 let UPDATE = null;      // {current, auto_update, can_self_update, info, ...}
+let WHATS_NEW = null;   // {current, from, to, entries, error, ...}
 const token = new URLSearchParams(location.search).get('token') || '';
 const api = (p, opts={}) => fetch(p + (p.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token), opts);
 const prevUrl = id => '/api/preview?id=' + encodeURIComponent(id) + '&token=' + encodeURIComponent(token);
@@ -920,7 +986,7 @@ async function saveNetworkMode(force){
     renderNetwork();
     toast('Connection: ' + modeLabel(mode));
     loadPeers(); loadLan();
-    maybeOnboardUpdate();     // one onboarding at a time: updates come after connection
+    maybeOnboardUpdate().then(opened => { if(!opened) maybeShowWhatsNew(); });
   } else toast('Error: ' + (r.error || 'failed'));
 }
 async function addManualPeer(){
@@ -958,6 +1024,7 @@ function renderUpdate(){
     status.innerHTML = '<span class="badge b-stock">up to date</span> v' + esc(UPDATE.current);
   }
   document.getElementById('updateNowBtn').style.display = (info && UPDATE.can_self_update) ? '' : 'none';
+  document.getElementById('whatsNewBtn').style.display = UPDATE.can_self_update ? '' : 'none';
   const link = document.getElementById('releaseLink');
   link.style.display = info ? '' : 'none';
   if(info) link.href = info.url || UPDATE.releases_url;
@@ -1019,6 +1086,7 @@ async function saveUpdateMode(mode){
     toast(mode === 'auto' ? 'Auto-updates on'
         : mode === 'check' ? 'Will check for updates on startup'
         : 'Auto-updates off \u2014 check manually');
+    maybeShowWhatsNew();      // one modal at a time: news comes after consent
   } else {
     toast('Error: ' + (r.error || 'failed'));
     loadUpdate();
@@ -1033,8 +1101,101 @@ function openUpdateModal(){
 }
 async function maybeOnboardUpdate(){
   const u = await loadUpdate();
-  if(u && u.local && u.needs_onboarding) openUpdateModal();
+  if(u && u.local && u.needs_onboarding){ openUpdateModal(); return true; }
+  return false;
 }
+
+// --- what's new (announced once after an update) ---------------------------
+function linkify(text, parent){
+  const re = /https?:\/\/[^\s)<>"]+/;
+  let rest = String(text == null ? '' : text);
+  while(rest){
+    const m = rest.match(re);
+    if(!m){ parent.appendChild(document.createTextNode(rest)); break; }
+    parent.appendChild(document.createTextNode(rest.slice(0, m.index)));
+    const a = document.createElement('a');
+    a.href = m[0]; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.textContent = m[0]; a.style.color = '#79c0ff';
+    parent.appendChild(a);
+    rest = rest.slice(m.index + m[0].length);
+  }
+}
+function whatsNewSection(entry){
+  const sec = document.createElement('div');
+  sec.style.margin = '0 0 14px';
+  const head = document.createElement('div');
+  head.style.cssText = 'color:var(--white);font-weight:700';
+  const label = 'v' + entry.version
+    + (entry.title && entry.title !== entry.tag ? '  \u2014  ' + entry.title : '');
+  head.appendChild(document.createTextNode(label));
+  const link = document.createElement('a');
+  link.href = entry.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+  link.textContent = 'View release \u2197';
+  link.style.cssText = 'color:#79c0ff;margin-left:8px;font-weight:400;font-size:12.5px';
+  head.appendChild(link);
+  sec.appendChild(head);
+  // The body is remote Markdown: render it as text (never innerHTML) so a
+  // malicious release can't inject markup into the page.
+  String(entry.body || '').split('\n').forEach(line => {
+    const t = line.trim();
+    if(!t) return;
+    const el = document.createElement('div');
+    if(/^#{1,6}\s/.test(t)){
+      el.style.cssText = 'color:var(--white);font-weight:600;margin-top:6px';
+      linkify(t.replace(/^#{1,6}\s+/, ''), el);
+    } else if(/^[*+-]\s/.test(t)){
+      el.style.cssText = 'margin-left:14px';
+      el.appendChild(document.createTextNode('\u2022 '));
+      linkify(t.replace(/^[*+-]\s+/, ''), el);
+    } else {
+      el.style.fontSize = '12.5px'; el.style.color = 'var(--fg2)';
+      linkify(t, el);
+    }
+    sec.appendChild(el);
+  });
+  return sec;
+}
+function renderWhatsNew(data){
+  WHATS_NEW = data;
+  const title = document.getElementById('whatsNewTitle');
+  const intro = document.getElementById('whatsNewIntro');
+  const body = document.getElementById('whatsNewBody');
+  body.textContent = '';
+  document.getElementById('whatsNewLink').href = data.releases_url || '#';
+  if(data.error){
+    title.textContent = "What's new in rpmap " + data.to;
+    intro.textContent = '';
+    const p = document.createElement('div');
+    p.className = 'muted';
+    p.textContent = 'Updated to v' + data.to
+      + (data.from ? ' (from v' + data.from + ')' : '') + '. ' + data.error
+      + ' \u2014 following the link opens the full release list.';
+    body.appendChild(p);
+    return;
+  }
+  if(!data.entries || !data.entries.length){
+    title.textContent = "rpmap v" + data.to;
+    intro.textContent = 'No release notes to show'
+      + (data.from ? ' since v' + data.from : '') + '.';
+    return;
+  }
+  title.textContent = "What's new in rpmap " + data.to;
+  intro.textContent = data.from
+    ? 'Updated from v' + data.from + ' to v' + data.to + '.'
+    : 'The latest rpmap release.';
+  data.entries.forEach(e => body.appendChild(whatsNewSection(e)));
+}
+async function openWhatsNew(manual){
+  let data;
+  try{ data = await (await api('/api/whatsnew' + (manual ? '?latest=1' : ''))).json(); }
+  catch(e){ return; }
+  if(!data || !data.packaged) return;
+  if(!manual && !data.show) return;
+  renderWhatsNew(data);
+  document.getElementById('whatsNewModal').style.display = '';
+}
+function closeWhatsNew(){ document.getElementById('whatsNewModal').style.display = 'none'; }
+function maybeShowWhatsNew(){ return openWhatsNew(false); }
 async function applyUpdate(){
   if(!confirm('Update rpmap now?\n\nIt downloads the new version, replaces the app, and restarts. '
               + 'This page will lose its server.')) return;
@@ -1108,7 +1269,7 @@ loadNetwork().then(() => {
   renderNetwork();
   loadPeers();
   if(NETWORK && NETWORK.needs_onboarding) openNetworkModal();
-  else maybeOnboardUpdate();      // no connection prompt -> offer the update one
+  else maybeOnboardUpdate().then(opened => { if(!opened) maybeShowWhatsNew(); });
 });
 const logPanel = document.getElementById('logPanel');
 if(logPanel) logPanel.addEventListener('toggle',
@@ -1292,6 +1453,9 @@ def make_handler(engine: dict):
                 status = _update_status(engine, refresh=bool(q.get("refresh")))
                 status["local"] = self._local_ok()
                 return self._json(status)
+
+            if u.path == "/api/whatsnew":
+                return self._json(_whats_new_status(engine, latest=bool(q.get("latest"))))
 
             if u.path == "/api/log":
                 if not self._local_ok():
@@ -1558,6 +1722,13 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
     if not cfg.get("port"):
         cfg["port"] = port
     save_config(cfg)
+    # Announce "what's new" once after an update: on a packaged build, remember
+    # the version we were last run at and keep the previous one for this run so
+    # the UI can show what changed. Source checkouts never self-update, so they
+    # don't touch this.
+    prev_version = None
+    if update._update_target() is not None:
+        prev_version = update.note_version_change(cfg, APP_VERSION)
     mode = network_mode(cfg)
     if not host:
         host = "0.0.0.0"          # all interfaces; requests are gated by source IP
@@ -1567,7 +1738,8 @@ def run_server(cooked: Path, slot: str, host: str, port: int, auto_open: bool,
     actual = _find_port(port) if host == "127.0.0.1" else port
     engine = {"cooked": cooked, "slot": slot, "token": token, "host": host,
               "secret": cfg["session_secret"], "cfg": cfg, "ident": ident,
-              "dev": dev, "port": actual, "network_mode": mode}
+              "dev": dev, "port": actual, "network_mode": mode,
+              "prev_version": prev_version}
     try:
         httpd = _HttpServer((host, actual), make_handler(engine))
     except OSError as e:

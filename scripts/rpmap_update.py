@@ -13,8 +13,9 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from rpmap_config import (APP_VERSION, GITHUB_RELEASES_API, GITHUB_RELEASES_PAGE,
-                          GITHUB_REPO, PRODUCT)
+from rpmap_config import (APP_VERSION, GITHUB_RELEASES_API, GITHUB_RELEASES_LIST_API,
+                          GITHUB_RELEASES_PAGE, GITHUB_REPO, PRODUCT,
+                          last_seen_version, save_config)
 
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +83,72 @@ def check_for_update() -> dict | None:
             break
     return {"tag": tag, "version": tag.lstrip("vV"), "url": url,
             "digest": digest, "size": size}
+
+
+def _release_entry(rel: dict) -> dict:
+    """A compact release dict (tag, title, body, url) for the UI."""
+    tag = str(rel.get("tag_name") or "").strip()
+    return {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "title": str(rel.get("name") or tag),
+        "body": str(rel.get("body") or ""),
+        "url": str(rel.get("html_url") or GITHUB_RELEASES_PAGE),
+        "published_at": str(rel.get("published_at") or ""),
+    }
+
+
+def _releases(timeout: float = 5.0) -> list | None:
+    """Every published GitHub release, or None if the request failed."""
+    req = urllib.request.Request(GITHUB_RELEASES_LIST_API, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{PRODUCT}/{APP_VERSION}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def release_notes(since: str, upto: str = APP_VERSION) -> list[dict] | None:
+    """Release notes for every version in ``(since, upto]``, newest first.
+
+    Returns None when GitHub can't be reached, so a caller can tell "offline"
+    from "nothing to show"; an empty list means the range has no notes (the
+    release may have been pruned - only the newest 10 are kept).
+    """
+    rels = _releases()
+    if rels is None:
+        return None
+    lo, hi = _version_tuple(since), _version_tuple(upto)
+    out = [_release_entry(rel) for rel in rels
+           if str(rel.get("tag_name") or "").strip()
+           and lo < _version_tuple(str(rel.get("tag_name"))) <= hi]
+    out.sort(key=lambda r: _version_tuple(r["tag"]), reverse=True)
+    return out
+
+
+def latest_release_notes(timeout: float = 5.0) -> dict | None:
+    """The newest release's notes, or None if GitHub can't be reached."""
+    rel = _latest_release(timeout)
+    return _release_entry(rel) if rel else None
+
+
+def note_version_change(cfg: dict, version: str = APP_VERSION) -> str | None:
+    """Record ``version`` as the last seen one; return the previous if it's older.
+
+    A returned previous version means the app changed since the user last ran
+    it, so the caller can announce "what's new". None on a first run or when
+    nothing changed. The current version is always stored.
+    """
+    prev = last_seen_version(cfg)
+    if prev == version:
+        return None
+    cfg["last_seen_version"] = version
+    save_config(cfg)
+    return prev if prev and _version_tuple(prev) < _version_tuple(version) else None
 
 
 def _update_refusal(info: dict) -> str | None:

@@ -224,6 +224,53 @@ class UpdateTests(unittest.TestCase):
         finally:
             shutil.rmtree(script.parent, ignore_errors=True)
 
+    def _patch_releases(self, rels):
+        orig = update._releases
+        update._releases = lambda timeout=5.0: rels
+        self.addCleanup(lambda: setattr(update, "_releases", orig))
+
+    def test_release_notes_filters_to_the_version_range(self):
+        self._patch_releases([
+            {"tag_name": "v0.9.0", "name": "v0.9.0", "body": "new",
+             "html_url": "u9", "published_at": ""},
+            {"tag_name": "v0.8.1", "name": "v0.8.1", "body": "b81",
+             "html_url": "u81", "published_at": ""},
+            {"tag_name": "v0.8.0", "name": "v0.8.0", "body": "b80",
+             "html_url": "u80", "published_at": ""},
+            {"tag_name": "v0.7.0", "name": "v0.7.0", "body": "old",
+             "html_url": "u7", "published_at": ""},
+        ])
+        notes = update.release_notes("0.8.0", "0.8.1")      # (0.8.0, 0.8.1]
+        self.assertEqual([n["tag"] for n in notes], ["v0.8.1"])
+        self.assertEqual(notes[0]["version"], "0.8.1")
+        self.assertEqual(notes[0]["url"], "u81")
+
+    def test_release_notes_are_newest_first(self):
+        self._patch_releases([
+            {"tag_name": "v0.8.1", "name": "", "body": "", "html_url": "", "published_at": ""},
+            {"tag_name": "v0.9.0", "name": "", "body": "", "html_url": "", "published_at": ""},
+            {"tag_name": "v0.8.5", "name": "", "body": "", "html_url": "", "published_at": ""},
+        ])
+        notes = update.release_notes("0.8.0", "0.9.0")
+        self.assertEqual([n["tag"] for n in notes], ["v0.9.0", "v0.8.5", "v0.8.1"])
+
+    def test_release_notes_none_when_github_is_unreachable(self):
+        self._patch_releases(None)
+        self.assertIsNone(update.release_notes("0.8.0", "0.9.0"))
+
+    def test_note_version_change_records_and_reports_updates(self):
+        saved = config.load_config()
+        self.addCleanup(lambda: config.save_config(saved))
+        cfg = {}
+        self.assertIsNone(update.note_version_change(cfg, "0.9.0"))     # first run
+        self.assertEqual(cfg["last_seen_version"], "0.9.0")
+        self.assertEqual(config.last_seen_version(config.load_config()), "0.9.0")
+        self.assertIsNone(update.note_version_change(cfg, "0.9.0"))     # unchanged
+        self.assertEqual(update.note_version_change(cfg, "0.9.1"), "0.9.0")  # updated
+        self.assertEqual(cfg["last_seen_version"], "0.9.1")
+        self.assertIsNone(update.note_version_change(cfg, "0.9.0"))     # downgrade
+        self.assertEqual(cfg["last_seen_version"], "0.9.0")
+
 
 class CaBundleTests(unittest.TestCase):
     """The packaged build must be able to find a CA bundle for TLS."""
@@ -1064,6 +1111,96 @@ class HttpTests(_CookedFixture):
                 break
             time.sleep(0.02)
         self.assertEqual(len(self.applied), 1)
+
+    # --- what's new (release notes announced after an update) -------------- #
+
+    def test_whats_new_hidden_on_a_source_build(self):
+        self._patch_update(target=None)
+        self.engine["prev_version"] = "0.8.1"
+        _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+        data = json.loads(body)
+        self.assertFalse(data["packaged"])
+        self.assertFalse(data["show"])
+        self.assertEqual(data["entries"], [])
+
+    def test_whats_new_does_not_show_on_the_first_run(self):
+        self._patch_update(target=(Path("/tmp/rpmap"), "file"))
+        self.engine["prev_version"] = None
+        _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+        data = json.loads(body)
+        self.assertTrue(data["packaged"])
+        self.assertFalse(data["show"])              # nothing to compare against
+
+    def test_whats_new_shows_the_notes_since_the_last_run(self):
+        self._patch_update(target=(Path("/tmp/rpmap"), "file"))
+        self.engine["prev_version"] = "0.8.0"
+        notes = [{"tag": "v0.9.0", "version": "0.9.0", "title": "v0.9.0",
+                  "body": "## What's Changed\n* A thing", "url": "u",
+                  "published_at": ""}]
+        calls = []
+        orig = web.update.release_notes
+        web.update.release_notes = (lambda since, upto=config.APP_VERSION:
+                                    calls.append(since) or notes)
+        try:
+            _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+            data = json.loads(body)
+            self.assertTrue(data["show"])
+            self.assertEqual(data["from"], "0.8.0")
+            self.assertEqual([e["tag"] for e in data["entries"]], ["v0.9.0"])
+            _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)  # cached
+        finally:
+            web.update.release_notes = orig
+        self.assertEqual(calls, ["0.8.0"])
+
+    def test_whats_new_reports_offline_without_caching(self):
+        self._patch_update(target=(Path("/tmp/rpmap"), "file"))
+        self.engine["prev_version"] = "0.8.0"
+        calls = []
+        orig = web.update.release_notes
+        web.update.release_notes = (lambda since, upto=config.APP_VERSION:
+                                    calls.append(1) or None)
+        try:
+            _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+            data = json.loads(body)
+            self.assertTrue(data["show"])           # still announce the update
+            self.assertIn("GitHub", data["error"])
+            self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+        finally:
+            web.update.release_notes = orig
+        self.assertEqual(len(calls), 2)             # a failure isn't cached
+
+    def test_whats_new_latest_returns_the_newest_release(self):
+        self._patch_update(target=(Path("/tmp/rpmap"), "file"))
+        self.engine["prev_version"] = None
+        entry = {"tag": "v0.9.0", "version": "0.9.0", "title": "v0.9.0",
+                 "body": "", "url": "u", "published_at": ""}
+        orig = web.update.latest_release_notes
+        web.update.latest_release_notes = lambda timeout=5.0: entry
+        try:
+            _, body = self._req("GET", "/api/whatsnew?latest=1&token=" + self.TOKEN)
+        finally:
+            web.update.latest_release_notes = orig
+        data = json.loads(body)
+        self.assertTrue(data["show"])
+        self.assertEqual([e["tag"] for e in data["entries"]], ["v0.9.0"])
+
+    def test_whats_new_announces_only_once_per_run(self):
+        self._patch_update(target=(Path("/tmp/rpmap"), "file"))
+        self.engine["prev_version"] = "0.8.0"
+        entry = {"tag": "v0.9.0", "version": "0.9.0", "title": "v0.9.0",
+                 "body": "", "url": "u", "published_at": ""}
+        orig_rn, orig_latest = web.update.release_notes, web.update.latest_release_notes
+        web.update.release_notes = lambda since, upto=config.APP_VERSION: []
+        web.update.latest_release_notes = lambda timeout=5.0: entry
+        try:
+            _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+            self.assertTrue(json.loads(body)["show"])
+            _, body = self._req("GET", "/api/whatsnew?token=" + self.TOKEN)
+            self.assertFalse(json.loads(body)["show"])   # already announced this run
+            _, body = self._req("GET", "/api/whatsnew?latest=1&token=" + self.TOKEN)
+            self.assertTrue(json.loads(body)["show"])     # manual reopen still works
+        finally:
+            web.update.release_notes, web.update.latest_release_notes = orig_rn, orig_latest
 
     def test_manual_peer_add_update_and_remove(self):
         _, body = self._req("POST", "/api/peers/manual?token=" + self.TOKEN,

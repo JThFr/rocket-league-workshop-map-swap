@@ -62,6 +62,7 @@ DEFAULT_AUTO_UPDATE = UPDATE_OFF
 # Where the packaged builds live (used only by the self-updater).
 GITHUB_REPO = "JThFr/rocket-league-workshop-map-swap"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_LIST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
 
@@ -190,6 +191,18 @@ def auto_update(cfg: dict | None = None) -> str:
     from "never asked" (the onboarding prompt).
     """
     return auto_update_setting(cfg) or DEFAULT_AUTO_UPDATE
+
+
+def last_seen_version(cfg: dict | None = None) -> str | None:
+    """The version recorded the last time the app ran, or None (never updated).
+
+    Used to announce "what's new" once after an update: a stored value that
+    differs from the running ``APP_VERSION`` means the app changed since the
+    user last saw it.
+    """
+    value = (cfg or {}).get("last_seen_version") if isinstance(cfg, dict) else None
+    value = str(value or "").strip()
+    return value or None
 
 
 def new_secret() -> str:
