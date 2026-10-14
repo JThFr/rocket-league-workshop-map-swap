@@ -24,9 +24,17 @@ Protocol (decoded from a live capture):
 A response echoes the query's ``Nonce``, so the relay is **bidirectional** - a
 canned beacon cannot be replayed, it has to round-trip the real query.
 
+Three loops share the same core:
+
+* :func:`run_host` - forward the host's responses, inject peers' queries.
+* :func:`run_join` - forward the local queries, inject the host's responses.
+* :func:`run_relay` - **symmetric**: forward both, inject everything; no
+  host/join choice, so everyone can host and join at once. Its loop guard
+  (:class:`_Seen`) is load-bearing - see the function docstring.
+
 Layering: depends on ``rpmap_config`` (the tailnet net) and ``rpmap_peers`` (the
-tailnet roster); imported by the CLI (``lan-host`` / ``lan-join``) and by the web
-UI (the "LAN discovery relay" panel, via the threaded :class:`Relay`).
+tailnet roster); imported by the CLI (``lan-host`` / ``lan-join`` / ``lan``) and
+by the web UI (the "LAN discovery relay" panel, via the threaded :class:`Relay`).
 """
 
 from __future__ import annotations
@@ -378,8 +386,96 @@ def run_join(*, host: str, token: str, relay_port: int = DEFAULT_RELAY_PORT,
     return 0
 
 
+def run_relay(*, peers: list[str], token: str, advertise: str | None = None,
+              relay_port: int = DEFAULT_RELAY_PORT, bind: str | None = None,
+              inject_mode: str = "broadcast", lan_port: int = LAN_PORT,
+              dev: bool = False, log=print, stop_event=None) -> int:
+    """Role-less relay: every node forwards and injects (symmetric mode).
+
+    Unlike :func:`run_host` / :func:`run_join` there is no host/join choice: each
+    node forwards **both** ``HostQuery`` and ``HostResponse`` to every peer and
+    injects whatever arrives. Whoever has a LAN match running is the only RL
+    that answers, so the host emerges automatically and multiple simultaneous
+    hosts are all visible; the node that captures a response rewrites its
+    ``ServerID`` to its own tailnet IP.
+
+    The loop guard is **load-bearing** here (unlike the explicit roles, where a
+    packet cannot structurally loop): a payload is marked seen *before* it is
+    injected, so the injected broadcast - which this node's own capture socket
+    hears again - is not re-forwarded, and relay-sourced traffic is only ever
+    injected, never forwarded onward. Both are what keep the mesh from storming.
+    """
+    advertise = advertise or local_advertise()
+    if not advertise:
+        raise SystemExit("lan: no Tailscale IPv4 detected; "
+                         "pass --advertise <100.x.y.z>")
+    peers = [p for p in peers if p]
+    if not peers:
+        raise SystemExit("lan: no peers; pass --peer <100.x.y.z> "
+                         "or bring a peer online on the tailnet")
+    bind = bind or advertise
+
+    cap = make_capture_socket(lan_port)
+    relay = make_relay_socket(relay_port, bind)
+    inj = make_inject_socket()
+    seen = _Seen()
+    log(f"lan: advertise={advertise}  peers={peers}  relay-port={relay_port}  "
+        f"bind={bind}  inject={inject_mode}")
+    log("lan: create or join a LAN match in Rocket League; waiting for discovery...")
+    try:
+        while not (stop_event is not None and stop_event.is_set()):
+            ready, _, _ = select.select([cap, relay], [], [], 1.0)
+            for s in ready:
+                data, addr = s.recvfrom(65535)
+                if s is cap:
+                    kind, _name = classify(data)
+                    if kind is None:
+                        continue
+                    if not seen.fresh(data):
+                        continue
+                    if kind == "response":
+                        res = rewrite_serverid(data, advertise)
+                        if res is None:
+                            log(f"capture: HostResponse without ServerID from "
+                                f"{addr[0]} (ignored)")
+                            continue
+                        out, old, new = res
+                        for ip in peers:
+                            relay.sendto(encode(token, TYPE_R, out),
+                                         (ip, relay_port))
+                        log(f"capture: HostResponse  {old} -> {new}  -> {peers}")
+                    else:
+                        for ip in peers:
+                            relay.sendto(encode(token, TYPE_Q, data),
+                                         (ip, relay_port))
+                        log(f"capture: HostQuery -> {peers}")
+                else:
+                    if not source_allowed(addr[0], dev):
+                        log(f"relay: dropped packet from {addr[0]} "
+                            f"(not on the tailnet)")
+                        continue
+                    typ, payload = decode(token, data)
+                    if typ is None:
+                        log(f"relay: dropped packet from {addr[0]} "
+                            f"(magic/token mismatch)")
+                        continue
+                    if typ in (TYPE_Q, TYPE_R):
+                        if not seen.fresh(payload):
+                            continue
+                        inject(inj, payload, inject_mode, lan_port)
+                        what = "HostQuery" if typ == TYPE_Q else "HostResponse"
+                        log(f"relay: injected {what} from {addr[0]} locally")
+                    else:
+                        log(f"relay: unexpected type {typ!r} from {addr[0]}")
+    except KeyboardInterrupt:
+        log("lan: stopped")
+    finally:
+        _close_all(cap, relay, inj)
+    return 0
+
+
 # --------------------------------------------------------------------------- #
-# Threaded controller (used by the web UI; the CLI runs run_host/run_join directly)
+# Threaded controller (used by the web UI; the CLI runs the loops directly)
 # --------------------------------------------------------------------------- #
 
 class Relay:
@@ -443,6 +539,11 @@ class Relay:
                          bind=self.bind, inject_mode=self.inject_mode,
                          lan_port=self.lan_port, dev=self.dev, log=self.log,
                          stop_event=self._stop)
+            elif self.mode == "relay":
+                run_relay(peers=self.peers, token=self.token, advertise=self.advertise,
+                          relay_port=self.relay_port, bind=self.bind,
+                          inject_mode=self.inject_mode, lan_port=self.lan_port,
+                          dev=self.dev, log=self.log, stop_event=self._stop)
             else:
                 run_host(peers=self.peers, token=self.token, advertise=self.advertise,
                          relay_port=self.relay_port, bind=self.bind,
