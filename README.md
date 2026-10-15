@@ -12,34 +12,23 @@ friends** normally means fighting the game and bolting on a lot of extra softwar
 that painless:
 
 - **Play from anywhere, with no L2 VPN.** Lobby discovery is a LAN broadcast, so the usual remote
-  setups (Hamachi, ZeroTier) exist to fake a virtual LAN. `rpmap` works over a plain Layer-3 VPN
-  (**Tailscale**) instead — it **relays Rocket League's LAN discovery** between peers, so the
-  in-game lobby list works without an L2 network. On a real LAN it needs no VPN at all.
-- **No BakkesMod needed.** The common way to host a custom-map lobby is Rocket Plugin, a
-  BakkesMod plugin. `rpmap` supports that route if you want it, but its **slot swap + discovery
-  relay** let you play **vanilla Rocket League** — no mods, no injector.
+  setups (Hamachi, ZeroTier) exist to fake a virtual LAN. `rpmap lan` **relays Rocket League's LAN
+  discovery** between peers over a plain Layer-3 VPN (**Tailscale**), so the in-game lobby list
+  works without an L2 network — the match then connects directly over that same tailnet. On a real
+  LAN it needs no VPN at all.
+- **No BakkesMod needed.** The common way to host a custom-map lobby is Rocket Plugin, a BakkesMod
+  plugin. `rpmap` supports that route if you want it, but its **slot swap + relay** let you play
+  **vanilla Rocket League** — no mods, no injector.
 - **No game restart to change maps.** Rocket League only loads map packages at **startup**, so
   switching maps mid-session normally forces a restart. `rpmap` **overwrites a stock arena slot**,
-  turning a map change into a plain file copy the running game picks up.
-- **Easy to sync up.** Everyone still needs the same map file, but `rpmap` shows **who's online
-  and which map each has loaded**, and can push/pull a switch for you — reference-only, so no map
-  bytes are transferred.
+  turning a map change into a plain file copy the running game picks up. The slot is configurable
+  (see [docs/usage.md](docs/usage.md)).
+- **Easy to sync up.** Everyone still needs the same map file, but **peer sync** shows who's online
+  and which map each has loaded (by slot, then `sha256`), and can push/pull a switch for you —
+  reference-only, so no map bytes are transferred.
 
 The upshot: agree on a map, swap it in, host a lobby, and everyone joins from the in-game list over
 the same Tailscale connection the game already uses.
-
-## What it does
-
-Three pieces, usable on their own:
-
-1. **Slot swap (no restart).** Overwrites a stock arena package so the game loads your map when
-   that arena is picked — backing up the stock file and swapping maps in and out. The slot is
-   configurable (see [docs/usage.md](docs/usage.md)).
-2. **Peer sync (reference-only).** Peers on the tailnet see what map each other has loaded (by
-   slot, then `sha256`) and can push/pull a switch — no map bytes are transferred.
-3. **Native LAN discovery (`rpmap lan`).** Relays Rocket League's LAN broadcast between tailnet
-   peers so the in-game lobby list works; symmetric by default (everyone can host and join), with
-   the explicit `lan-host` / `lan-join` pair still available.
 
 ## Get it
 
