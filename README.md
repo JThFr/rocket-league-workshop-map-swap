@@ -12,11 +12,11 @@ friends** normally means fighting the game and bolting on a lot of extra softwar
 that painless:
 
 - **Play from anywhere, with no L2 VPN.** Lobby discovery is a LAN broadcast, so the usual remote
-  setups (Hamachi, ZeroTier) exist to fake a virtual LAN. A Layer-3 VPN sidesteps all of that — no
-  virtual LAN or subnet to manage, no reliance on broadcasts or multicast crossing the tunnel, and
-  no Layer-2 MTU quirks. `rpmap lan` **relays Rocket League's LAN discovery** between peers over a
-  plain Layer-3 VPN (**Tailscale**), so the in-game lobby list works without an L2 network — the
-  match then connects directly over that same tailnet. On a real LAN it needs no VPN at all.
+  setups (Hamachi, ZeroTier) exist to fake a virtual LAN. A Layer-3 VPN is simpler and less flaky:
+  there's no virtual LAN to set up, and nothing depends on LAN-style broadcasts making it across
+  the internet. `rpmap lan` **relays Rocket League's LAN discovery** between peers over a plain
+  Layer-3 VPN (**Tailscale**), so the in-game lobby list works without an L2 network — the match
+  then connects directly over that same tailnet. On a real LAN it needs no VPN at all.
 - **No BakkesMod needed.** The common way to host a custom-map lobby is Rocket Plugin, a BakkesMod
   plugin. `rpmap` supports that route if you want it, but its **slot swap + relay** let you play
   **vanilla Rocket League** — no mods, no injector.
