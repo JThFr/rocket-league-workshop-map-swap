@@ -7,41 +7,29 @@ dependencies.
 
 ## Why this exists
 
-The way we play: everyone runs the **same workshop map**, and someone **hosts a lobby** so
-friends can join. Rocket Plugin (a BakkesMod plugin) is one way to host; the game's own
-**Create LAN / Join LAN** lobby is another. `rpmap` smooths out both, because two things get in
-the way:
+Rocket League has a huge library of **custom/workshop maps**, but playing them **together with
+friends** normally means fighting the game and bolting on a lot of extra software. `rpmap` makes
+that painless:
 
-1. **A new map normally means a restart.** Rocket League only loads map packages at **game
-   startup**, so when a client doesn't already have the selected map, Rocket Plugin's only
-   option is **"Copy Map and Restart"**. `rpmap` avoids the restart — by **staging maps** into
-   the folders Rocket Plugin uses *before* the game launches, and (the headline trick) by
-   **swapping a stock arena slot** so changing the map is just a file copy the running game
-   picks up — no restart at all.
-2. **Your friends aren't on your LAN.** Lobbies are joined by **IP : port** (UDP 7777), and
-   the game's built-in "Local Match" discovery needs a LAN broadcast, which doesn't cross the
-   internet. **Tailscale** — a mesh VPN — gives everyone a stable `100.x.y.z` address and a
-   direct path, so the IP join just works; `rpmap` also **relays that LAN discovery** so the
-   in-game lobby list works over Tailscale too (no plugin needed). The same tailnet is how the
-   **peer sync** sees who has which map loaded.
+- **Play from anywhere, with no L2 VPN.** Lobby discovery is a LAN broadcast, so the usual remote
+  setups (Hamachi, ZeroTier) exist to fake a virtual LAN. A Layer-3 VPN is simpler and less flaky:
+  there's no virtual LAN to set up, and nothing depends on LAN-style broadcasts making it across
+  the internet. `rpmap lan` **relays Rocket League's LAN discovery** between peers over a plain
+  Layer-3 VPN (**Tailscale**), so the in-game lobby list works without an L2 network — the match
+  then connects directly over that same tailnet. On a real LAN it needs no VPN at all.
+- **No BakkesMod needed.** The common way to host a custom-map lobby is Rocket Plugin, a BakkesMod
+  plugin. `rpmap` supports that route if you want it, but its **slot swap + relay** let you play
+  **vanilla Rocket League** — no mods, no injector.
+- **No game restart to change maps.** Rocket League only loads map packages at **startup**, so
+  switching maps mid-session normally forces a restart. `rpmap` **overwrites a stock arena slot**,
+  turning a map change into a plain file copy the running game picks up. The slot is configurable
+  (see [docs/usage.md](docs/usage.md)).
+- **Easy to sync up.** Everyone still needs the same map file, but **peer sync** shows who's online
+  and which map each has loaded (by slot, then `sha256`), and can push/pull a switch for you —
+  reference-only, so no map bytes are transferred.
 
-## What it does
-
-1. **Slot swap (no restart).** Rocket League loads a stock arena package whenever you pick
-   that arena. Overwrite that one file and the game loads your map — no plugin, no restart.
-   `rpmap` backs up the stock file and swaps maps in and out; which arena slot it uses is
-   configurable (see [docs/usage.md](docs/usage.md)).
-2. **Rocket Plugin staging.** Copy maps into `CookedPCConsole/{mods,rocketplugin}` so Rocket
-   Plugin sees them without its "Copy Map and Restart" step.
-3. **Peer sync (reference-only).** Peers on a Tailscale tailnet see what map each other has
-   loaded (compared by slot, then `sha256`) and can push/pull a switch. No map bytes are
-   transferred — each peer loads the map from its own copy.
-4. **Native LAN discovery (relay).** Rocket League's built-in **Create LAN / Join LAN** list
-   normally can't cross the internet, because the discovery broadcast never leaves the local
-   network. `rpmap lan` relays that discovery between tailnet peers, so the in-game lobby list
-   works — no BakkesMod or Rocket Plugin needed at all (you can also start/stop the relay from
-   the web UI). The symmetric default lets **everyone host and join at once**; the explicit
-   `lan-host` / `lan-join` pair is still there. The match itself connects directly over Tailscale.
+The upshot: agree on a map, swap it in, host a lobby, and everyone joins from the in-game list over
+the same Tailscale connection the game already uses.
 
 ## Get it
 
