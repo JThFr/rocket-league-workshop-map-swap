@@ -2,26 +2,28 @@
 
 **`rpmap`** — a helper to play **custom / workshop maps with friends in a Rocket League
 multiplayer lobby**, across **Linux and Windows**, without restarting the game every time the
-map changes. Shipped as ready-to-run binaries; built from a single Python 3 script with no
+map changes. Shipped as ready-to-run binaries; built from a few small Python 3 modules with no
 dependencies.
 
 ## Why this exists
 
-The way we play: one person **hosts a lobby with Rocket Plugin** (a BakkesMod plugin) so
-friends can join a custom-map game, and everyone plays the same workshop map. Two things get
-in the way, and this tool exists to smooth them out:
+The way we play: everyone runs the **same workshop map**, and someone **hosts a lobby** so
+friends can join. Rocket Plugin (a BakkesMod plugin) is one way to host; the game's own
+**Create LAN / Join LAN** lobby is another. `rpmap` smooths out both, because two things get in
+the way:
 
-1. **Rocket Plugin makes everyone restart to load a new map.** Rocket League only loads map
-   packages at **game startup**, so when a client doesn't already have the selected map,
-   Rocket Plugin's only option is **"Copy Map and Restart"**. `rpmap` avoids the restart where
-   it can — by **staging maps** into the folders Rocket Plugin uses *before* the game
-   launches, and (the headline trick) by **swapping a stock arena slot** so changing the map
-   is just a file copy the running game picks up — no restart at all.
-2. **Your friends aren't on your LAN.** Rocket Plugin lobbies are joined by **IP : port**
-   (UDP 7777), and the built-in "Local Match" discovery needs LAN broadcast, which doesn't
-   cross the internet. **Tailscale** — a mesh VPN — gives everyone a stable `100.x.y.z`
-   address and a direct path, so the IP join just works. That's what the Tailscale parts are
-   for: the same tailnet is also how the **peer sync** sees who has which map loaded.
+1. **A new map normally means a restart.** Rocket League only loads map packages at **game
+   startup**, so when a client doesn't already have the selected map, Rocket Plugin's only
+   option is **"Copy Map and Restart"**. `rpmap` avoids the restart — by **staging maps** into
+   the folders Rocket Plugin uses *before* the game launches, and (the headline trick) by
+   **swapping a stock arena slot** so changing the map is just a file copy the running game
+   picks up — no restart at all.
+2. **Your friends aren't on your LAN.** Lobbies are joined by **IP : port** (UDP 7777), and
+   the game's built-in "Local Match" discovery needs a LAN broadcast, which doesn't cross the
+   internet. **Tailscale** — a mesh VPN — gives everyone a stable `100.x.y.z` address and a
+   direct path, so the IP join just works; `rpmap` also **relays that LAN discovery** so the
+   in-game lobby list works over Tailscale too (no plugin needed). The same tailnet is how the
+   **peer sync** sees who has which map loaded.
 
 ## What it does
 
@@ -32,14 +34,14 @@ in the way, and this tool exists to smooth them out:
 2. **Rocket Plugin staging.** Copy maps into `CookedPCConsole/{mods,rocketplugin}` so Rocket
    Plugin sees them without its "Copy Map and Restart" step.
 3. **Peer sync (reference-only).** Peers on a Tailscale tailnet see what map each other has
-   loaded (compared by `sha256`) and can push/pull a switch. No map bytes are transferred —
-   each peer loads the map from its own copy.
+   loaded (compared by slot, then `sha256`) and can push/pull a switch. No map bytes are
+   transferred — each peer loads the map from its own copy.
 4. **Native LAN discovery (relay).** Rocket League's built-in **Create LAN / Join LAN** list
    normally can't cross the internet, because the discovery broadcast never leaves the local
-   network. `rpmap lan-host` / `lan-join` relay that discovery between tailnet peers, so the
-   in-game lobby list works — no BakkesMod or Rocket Plugin needed just to *find* the host (you
-   can also start/stop the relay from the web UI). The match itself still connects directly over
-   Tailscale.
+   network. `rpmap lan` relays that discovery between tailnet peers, so the in-game lobby list
+   works — no BakkesMod or Rocket Plugin needed at all (you can also start/stop the relay from
+   the web UI). The symmetric default lets **everyone host and join at once**; the explicit
+   `lan-host` / `lan-join` pair is still there. The match itself connects directly over Tailscale.
 
 ## Get it
 
@@ -150,11 +152,16 @@ serving rpmap.
 
 Each machine runs its own `rpmap` server (listening on all interfaces, gated to the
 tailnet in Tailscale mode — no `--host` needed) and shares a session code.
-The **Players** panel then shows who's online and what each has loaded (compared by `sha256`),
-with **Switch me** / **Set theirs** / **Load mine on everyone** actions. In local-network mode
-the roster is your manually-added peers instead of the tailnet. Syncs are **explicit**
-and reference-only — no map bytes move; anything obtained outside the Steam Workshop syncs
-only if the peer already has the byte-identical file. Never swap during an online match.
+The **Players** panel then shows who's online and what each has loaded, with **Switch me** /
+**Set theirs** / **Load mine on everyone** actions and an **Only maps everyone has** filter.
+In local-network mode the roster is your manually-added peers instead of the tailnet. Syncs are
+**explicit** and reference-only — no map bytes move; anything obtained outside the Steam Workshop
+syncs only if the peer already has the byte-identical file. Never swap during an online match.
+
+Sync state is **slot-aware**: two players on the same *stock* arena count as in sync (only custom
+maps are byte-compared), so build/platform differences in the stock `.upk` don't raise a false
+mismatch. Each poll also measures the **round-trip time** to every reachable peer — the table's
+**Ping** column — and the lowest-latency node gets a **★ host** badge as the recommended host.
 
 ## Documentation
 
@@ -169,15 +176,17 @@ Rocket League's **Create LAN / Join LAN** list is driven by a broadcast that a n
 real LAN or an L2 VPN carries the broadcast itself):
 
 ```bash
-# on the machine hosting the LAN match
-python3 rpmap.py lan-host
-# on each joiner
-python3 rpmap.py lan-join --host <host-tailnet-ip>
+# run on every machine (symmetric — anyone can host and join at once):
+python3 rpmap.py lan
+
+# or the explicit-role pair:
+#   host:    python3 rpmap.py lan-host
+#   joiner:  python3 rpmap.py lan-join --host <host-tailnet-ip>
 ```
 
-Both sides use the shared **session code** (the relay token defaults to it). On the joiner, open
-the game's **Join LAN / local lobby** list — the host's lobby appears and connects straight to the
-host's `100.x:7777`. The relay carries **only discovery**; the match itself runs over Tailscale.
+All sides use the shared **session code** (the relay token defaults to it). Then open the game's
+**Join LAN / local lobby** list — the host's lobby appears and connects straight to the host's
+`100.x:7777`. The relay carries **only discovery**; the match itself runs over Tailscale.
 Validated in-game between a Linux host and a Windows peer.
 
 ## License

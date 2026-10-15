@@ -41,8 +41,9 @@ stop it without a terminal. This matters after a **self-update**, when the app r
 | `python3 rpmap.py fetch <host> [port]` | download the host's map and stage it |
 | `python3 rpmap.py peers` | tailnet peers and the map each has loaded |
 | `python3 rpmap.py serve [--host H --port P] [--network tailscale\|lan] [--restore-on-exit]` | run the web UI / peer server |
-| `python3 rpmap.py lan-host [--peer IP]...` | relay native LAN discovery (you host the LAN match) |
-| `python3 rpmap.py lan-join --host IP` | receive relayed native LAN discovery (you join) |
+| `python3 rpmap.py lan` | relay native LAN discovery both ways — everyone can host and join |
+| `python3 rpmap.py lan-host [--peer IP]...` | (explicit roles) relay native LAN discovery as the host |
+| `python3 rpmap.py lan-join --host IP` | (explicit roles) receive relayed native LAN discovery as a joiner |
 | `python3 rpmap.py session [--new]` · `join <code>` · `name <display>` | shared session code / identity |
 | `python3 rpmap.py network [tailscale\|lan]` | show or set the peer connection mode |
 | `python3 rpmap.py stop` | stop a running web UI (same as its Quit button) |
@@ -139,7 +140,11 @@ Design notes: [`rpmap-phase2.md`](rpmap-phase2.md).
 
 The **Players** panel labels a tailnet node that isn't usable: *offline*, *online · not rpmap*
 (Tailscale is up there but rpmap isn't running / isn't bound to the tailnet), or *rpmap · no map
-list* (an older build). "In sync" counts only the reachable rpmap peers.
+list* (an older build). "In sync" counts only the reachable rpmap peers, and is **slot-aware** —
+two players on the same *stock* arena count as in sync (only custom maps are byte-compared), so
+build/platform differences in the stock `.upk` don't raise a false mismatch. Each poll also
+measures the round-trip time to every reachable peer (the **Ping** column, three bars), and the
+lowest-latency node gets a **★ host** badge as the recommended host.
 
 ## Native LAN discovery over Tailscale
 
@@ -150,10 +155,12 @@ in-game lobby browser without BakkesMod/Rocket Plugin. The relay is **only for T
 a real LAN or an L2 VPN carries the broadcast itself, so it's hidden in local-network mode:
 
 ```bash
-# on the machine hosting the LAN match
-python3 rpmap.py lan-host
-# on every joiner (host's tailnet IP)
-python3 rpmap.py lan-join --host 100.x.y.z
+# run on every machine (symmetric — anyone can host and join at once, the default):
+python3 rpmap.py lan
+
+# or the explicit-role pair:
+python3 rpmap.py lan-host                    # on the machine hosting the LAN match
+python3 rpmap.py lan-join --host 100.x.y.z   # on every joiner (host's tailnet IP)
 ```
 
 Then: the host **creates a LAN match**; each joiner opens the **Join LAN / local lobby** list, the
@@ -161,12 +168,15 @@ host's lobby appears, and clicking it **connects directly to the host's `100.x:7
 Tailscale. Only the discovery is relayed — the match itself is a normal Tailscale connection.
 
 You can also run it entirely from the **web UI's "LAN discovery relay" panel**: choose
-**I'm hosting** or **I'm joining** (enter the host's tailnet IP), then **Start relay** / **Stop**.
-The panel shows whether it's relaying, and quitting rpmap stops it.
+**Everyone (host & join)** (the default), or **I'm hosting** / **I'm joining** (enter the host's
+tailnet IP) for the explicit roles, then **Start relay** / **Stop**. The panel shows whether it's
+relaying, and quitting rpmap stops it.
 
 - The shared **session code** is the relay token by default (`~/.config/rpmap/config.json`, or
   `rpmap session`), so both sides just need the same code; `--token` overrides.
-- `lan-host` targets **all online tailnet peers** by default (`--peer <ip>` to restrict).
+- `rpmap lan` and `lan-host` target **all online tailnet peers** by default (`--peer <ip>` to
+  restrict). In symmetric mode the **loop guard** matters: only locally-captured traffic is
+  forwarded, so injected broadcasts are never re-forwarded into a storm.
 - The relay binds to this machine's **tailnet IP** and drops packets from non-tailnet sources;
   `--bind`, `--relay-port` (default `14002`), `--inject broadcast|loopback`, `--lan-port`
   (default `14001`) and `--advertise <ip>` (host: the address written into the lobby reply) are
@@ -254,7 +264,9 @@ rollback links survive — only the release and its downloadable assets are remo
 
 **Bump `VERSION` in every PR** — a CI check (`version-check`) fails a pull request whose `VERSION`
 is not a valid increase over `main`, for example `0.3.1 → 0.3.2` (patch), `0.3.1 → 0.4.0` (minor),
-`0.4.0 → 1.0.0` (major).
+`0.4.0 → 1.0.0` (major). **Docs-only PRs are exempt**: a change that touches only Markdown, `docs/`,
+`maps/` or `LICENSE` ships no new behaviour, so it needn't bump the version (and, since the version
+is unchanged, cuts no release).
 
 ## Building locally
 
