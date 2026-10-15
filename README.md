@@ -30,16 +30,14 @@ the same Tailscale connection the game already uses.
 
 ## What it does
 
-Four pieces, usable on their own:
+Three pieces, usable on their own:
 
 1. **Slot swap (no restart).** Overwrites a stock arena package so the game loads your map when
    that arena is picked — backing up the stock file and swapping maps in and out. The slot is
    configurable (see [docs/usage.md](docs/usage.md)).
-2. **Rocket Plugin staging.** Pre-copies maps into `CookedPCConsole/{mods,rocketplugin}` so Rocket
-   Plugin sees them without its "Copy Map and Restart" step.
-3. **Peer sync (reference-only).** Peers on the tailnet see what map each other has loaded (by
+2. **Peer sync (reference-only).** Peers on the tailnet see what map each other has loaded (by
    slot, then `sha256`) and can push/pull a switch — no map bytes are transferred.
-4. **Native LAN discovery (`rpmap lan`).** Relays Rocket League's LAN broadcast between tailnet
+3. **Native LAN discovery (`rpmap lan`).** Relays Rocket League's LAN broadcast between tailnet
    peers so the in-game lobby list works; symmetric by default (everyone can host and join), with
    the explicit `lan-host` / `lan-join` pair still available.
 
