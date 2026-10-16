@@ -86,11 +86,14 @@ _As originally designed (transfer in **italics** is not implemented):_
 GET  /api/capabilities        -> {product, version, peer_id, name, port, slot:{..., sha256, workshop_id}, ping_ms}
 GET  /api/state               -> {peer, slot:{..., sha256, workshop_id}}
 GET  /api/peers               -> {self:{...}, peers:[{peer_id, name, ip, online, rpmap?, slot?, sha256?, in_sync?}]}
-GET  /api/ping                -> {ok:true}   (cheap latency target for peers to time)
+GET  /api/ping                -> {ok:true, rtt}   (latency target; `rtt` = our own
+                                                    measured RTT to the caller, so
+                                                    both ends agree on the link)
 GET  /api/session             -> {peer_id, name, port, secret}
 POST /api/peer/switch         -> {workshop_id?, name?, sha256?}   (resolve locally, verify, swap)
 POST /api/sync                -> {mode:"push"|"pull", peers:[{ip,port,name}]}
 POST /api/session             -> {secret}  (set/rotate the shared secret; local only)
+POST /api/name                -> {name}    (set/clear the display name; local only)
 _GET  /api/map?sha256=<sha256> -> raw bytes (NOT implemented — reference-only)_
 ```
 
@@ -113,9 +116,9 @@ Display per peer: `same` / `different` / `unknown` (peer unreachable or hash mis
 - `POST /api/sync` targets are validated against the tailnet roster (incl. `manual_peers`);
   anything else is refused — the API must never become an arbitrary-request proxy or send the
   session secret to an unknown host.
-- `POST /api/session` (rotate the shared secret) is local-only, like `/api/quit`; the local
-  gate accepts loopback **and this machine's own tailnet address** (the local browser reaches
-  a tailnet-bound UI from that address).
+- `POST /api/session` (rotate the shared secret) and `POST /api/name` (set the
+  display name) are local-only, like `/api/quit`; the local gate accepts loopback **and this
+  machine's own tailnet address** (the local browser reaches a tailnet-bound UI from that address).
 - The UI passes ids as data attributes to a delegated listener — never interpolated into
   generated JS — and every response carries `X-Content-Type-Options: nosniff` and
   `Referrer-Policy: no-referrer`.
@@ -141,7 +144,8 @@ Display per peer: `same` / `different` / `unknown` (peer unreachable or hash mis
 
 ## Open decisions
 
-- Identity source: Tailscale hostname vs a configured display name (do both?).
+- Identity source: Tailscale hostname (`peer_id`, stable addressing) **and** a
+  user-set **display name** (shown to peers; falls back to the hostname) — both.
 - Explicit "sync" vs automatic propagation — **recommend explicit first**.
 - Fixed port vs advertised/discovered port.
 - How the shared secret is created and shared (UI paste box? a file? Tailscale ACL only?).

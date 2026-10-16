@@ -200,8 +200,8 @@ def local_ping_avg() -> float | None:
     return _self_ping_avg
 
 
-def ping_peer(ip: str | None, port: int, secret: str,
-              samples: int = 3, timeout: float = 2.0) -> float | None:
+def _measure_rtt(ip: str | None, port: int, secret: str,
+                 samples: int = 3, timeout: float = 2.0) -> float | None:
     """Average round-trip time to a peer's lightweight ``/api/ping``, in ms.
 
     HTTP RTT is a portable stand-in for ICMP: it needs no privileges, works in
@@ -219,12 +219,53 @@ def ping_peer(ip: str | None, port: int, secret: str,
         except Exception:
             return None
         vals.append((time.perf_counter() - t0) * 1000.0)
-    return round(sum(vals) / len(vals), 1) if vals else None
+    return sum(vals) / len(vals) if vals else None
 
 
-def _probe_and_ping(ip: str | None, port: int, secret: str) -> tuple[dict | None, float | None]:
+def _peer_rtt(ip: str | None, port: int, secret: str,
+              timeout: float = 2.0) -> float | None:
+    """The peer's own measured RTT to *us*, as its ``/api/ping`` reports it.
+
+    Every server answers ``/api/ping`` with its latest measurement of the
+    caller. That is the half of the link this machine cannot measure itself, so
+    the two one-way estimates meet in the middle (see :func:`ping_peer`).
+    """
+    if not ip:
+        return None
+    try:
+        got = _http_get_json_auth(f"http://{ip}:{port}/api/ping", secret, timeout)
+        value = got.get("rtt")
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def ping_peer(ip: str | None, port: int, secret: str,
+              samples: int = 3, timeout: float = 2.0,
+              store: dict | None = None) -> float | None:
+    """A **symmetric** round-trip estimate for the link to a peer, in ms.
+
+    A single one-way measurement is inherently noisy, so two machines measuring
+    each other would disagree (A sees 40 ms, B sees 55 ms). Instead each side
+    keeps its *own* measurement, shares it over ``/api/ping``, and reports the
+    **worse** of the two directions - so A and B show the *same* number for the
+    link, and it is the conservative one. ``store`` (the live server's map)
+    records our own measurement so the peer gets it when it probes us. Returns
+    None if the peer is unreachable.
+    """
+    own = _measure_rtt(ip, port, secret, samples, timeout)
+    if own is None:
+        return None
+    if store is not None and ip:
+        store[ip] = round(own, 1)
+    theirs = _peer_rtt(ip, port, secret, timeout)
+    return round(max(own, theirs) if theirs is not None else own, 1)
+
+
+def _probe_and_ping(ip: str | None, port: int, secret: str,
+                    store: dict | None = None) -> tuple[dict | None, float | None]:
     got = probe_peer(ip, port, secret)
-    return got, (ping_peer(ip, port, secret) if got else None)
+    return got, (ping_peer(ip, port, secret, store=store) if got else None)
 
 
 def common_map_keys(key_sets: list[set[str] | None]) -> list[str] | None:
@@ -316,12 +357,15 @@ def _recommended_host(self_key: str, self_avg: float | None,
     return min(averages, key=lambda kv: kv[1])[0] if len(averages) >= 2 else None
 
 
-def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
+def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict,
+                 store: dict | None = None) -> dict:
     """Probe every peer in parallel and build the roster for this machine.
 
     Also measures the round-trip time to each reachable peer, averages this
     machine's own pings (shared with peers so they can spot the lowest), and
-    flags the node with the lowest average as the recommended host.
+    flags the node with the lowest average as the recommended host. ``store``
+    (a live server's dict) keeps our own per-peer measurements so a peer probing
+    us reports the same, symmetric link latency we do.
     """
     global _self_ping_avg
     secret = cfg.get("session_secret") or ""
@@ -336,7 +380,7 @@ def gather_peers(cooked: Path, slot: str, cfg: dict, ident: dict) -> dict:
             futs = {}
             for p in peers:
                 pport = int(p.get("port") or port)
-                futs[ex.submit(_probe_and_ping, p.get("ip"), pport, secret)] = p
+                futs[ex.submit(_probe_and_ping, p.get("ip"), pport, secret, store)] = p
             for fut in concurrent.futures.as_completed(futs):
                 try:
                     got, ping = fut.result()

@@ -491,6 +491,36 @@ class PeerTests(unittest.TestCase):
                 {"peer_id": "c", "rpmap": True, "peer_avg_ms": None}]
         self.assertIsNone(peers._recommended_host("me", 50.0, rows))
 
+    def test_ping_reports_the_worse_of_the_two_directions(self):
+        # Two machines measure each other; each keeps its own number and reads
+        # the other's from /api/ping, then reports the worse - so both agree.
+        saved = (peers._measure_rtt, peers._peer_rtt)
+        peers._measure_rtt = lambda ip, port, secret, samples=3, timeout=2.0: 42.0
+        peers._peer_rtt = lambda ip, port, secret, timeout=2.0: 55.0
+        store: dict = {}
+        try:
+            self.assertEqual(peers.ping_peer("100.0.0.2", 8787, "s", store=store), 55.0)
+        finally:
+            peers._measure_rtt, peers._peer_rtt = saved
+        self.assertEqual(store, {"100.0.0.2": 42.0})   # our own number is kept/shared
+
+    def test_ping_falls_back_to_our_own_measurement(self):
+        saved = (peers._measure_rtt, peers._peer_rtt)
+        peers._measure_rtt = lambda ip, port, secret, samples=3, timeout=2.0: 42.0
+        peers._peer_rtt = lambda ip, port, secret, timeout=2.0: None
+        try:
+            self.assertEqual(peers.ping_peer("100.0.0.2", 8787, "s"), 42.0)
+        finally:
+            peers._measure_rtt, peers._peer_rtt = saved
+
+    def test_ping_is_none_when_the_peer_is_unreachable(self):
+        saved = peers._measure_rtt
+        peers._measure_rtt = lambda ip, port, secret, samples=3, timeout=2.0: None
+        try:
+            self.assertIsNone(peers.ping_peer("100.0.0.2", 8787, "s"))
+        finally:
+            peers._measure_rtt = saved
+
 
 class LanRelayTests(unittest.TestCase):
     """The native LAN discovery relay core."""
@@ -1222,7 +1252,41 @@ class HttpTests(_CookedFixture):
         status, body = self._req("GET", "/api/ping?token=" + self.TOKEN)
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["ok"])
+        self.assertIsNone(json.loads(body)["rtt"])       # nothing measured yet
+        self.engine["pings"] = {"127.0.0.1": 33.3}       # our measurement of the caller
+        _, body = self._req("GET", "/api/ping?token=" + self.TOKEN)
+        self.assertEqual(json.loads(body)["rtt"], 33.3)  # shared so peers can agree
         self.assertEqual(self._req("GET", "/api/ping")[0], 403)   # still authed
+
+    def test_name_is_local_and_round_trips_to_peers(self):
+        saved = config.load_config()
+        self.addCleanup(lambda: config.save_config(saved))
+        status, body = self._req("POST", "/api/name?token=" + self.TOKEN,
+                                 body={"name": "Julien"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["name"], "Julien")
+        self.assertEqual(config.load_config()["display_name"], "Julien")
+        # A peer discovers it through the capabilities handshake...
+        _, body = self._req("GET", "/api/capabilities?token=" + self.TOKEN)
+        self.assertEqual(json.loads(body)["name"], "Julien")
+        # ...and the local UI reads it back from /api/session.
+        _, body = self._req("GET", "/api/session?token=" + self.TOKEN)
+        self.assertEqual(json.loads(body)["name"], "Julien")
+
+    def test_name_is_sanitised_and_can_be_cleared(self):
+        saved = config.load_config()
+        self.addCleanup(lambda: config.save_config(saved))
+        _, body = self._req("POST", "/api/name?token=" + self.TOKEN,
+                            body={"name": "  A\nB\tC  "})
+        self.assertEqual(json.loads(body)["name"], "ABC")   # control chars dropped
+        self.assertEqual(json.loads(body)["display_name"], "ABC")
+        _, body = self._req("POST", "/api/name?token=" + self.TOKEN, body={"name": ""})
+        self.assertIsNone(json.loads(body)["display_name"])
+        self.assertEqual(json.loads(body)["name"], "tester")   # falls back to peer_id
+        _, body = self._req("GET", "/api/capabilities?token=" + self.TOKEN)
+        self.assertEqual(json.loads(body)["name"], "tester")
 
     def test_capabilities_shares_our_average_ping(self):
         peers._self_ping_avg = 42.5
@@ -1808,6 +1872,86 @@ class EveryoneFilterTests(unittest.TestCase):
         reach = {r["name"]: r["reach"] for r in data["peers"]}
         self.assertEqual(reach["off"], "offline")
         self.assertEqual(reach["up"], "not-rpmap")
+
+
+class SymmetricPingTests(unittest.TestCase):
+    """Two real servers agree on a link's ping (A's view == B's view).
+
+    Each machine measures the other one-way; the numbers can differ (A sees
+    40 ms, B sees 60 ms). Each server also reports its *own* measurement over
+    ``/api/ping``, and both then display the worse direction - so the roster
+    reads identically on both screens.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="rpmap-symping-")
+        root = Path(self._tmp.name)
+        self.cooked, self.engines, self.srvs = [], [], []
+        for i in (1, 2):
+            cooked = root / f"m{i}" / "TAGame" / "CookedPCConsole"
+            (cooked / "mods").mkdir(parents=True)
+            (cooked / "mods" / "Shared.upk").write_bytes(b"SHARED")
+            self.cooked.append(cooked)
+            eng = {"cooked": cooked, "slot": "underpass", "token": "t",
+                   "host": "127.0.0.1", "secret": "s3cr3t", "cfg": {},
+                   "ident": {"peer_id": f"m{i}", "name": f"m{i}", "ips": [], "dns": ""},
+                   "dev": False, "port": 0}
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(eng))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.engines.append(eng)
+            self.srvs.append(srv)
+        self._steam_libs = maps._steam_libraries
+        maps._steam_libraries = lambda: []
+
+    def tearDown(self):
+        for srv in self.srvs:
+            srv.shutdown()
+            srv.server_close()
+        maps._steam_libraries = self._steam_libs
+        peers._self_ping_avg = None
+        self._tmp.cleanup()
+
+    def _gather(self, which):
+        """Let machine `which` poll the other; returns its roster payload."""
+        other = 1 - which
+        port = self.srvs[other].server_address[1]
+        orig = peers.tailscale_peers
+        peers.tailscale_peers = lambda cfg=None: [
+            {"peer_id": f"m{other + 1}", "name": f"m{other + 1}", "dns": "",
+             "ip": "127.0.0.1", "port": port, "online": True, "os": "linux"}]
+        try:
+            return peers.gather_peers(
+                self.cooked[which], "underpass", {"session_secret": "s3cr3t"},
+                self.engines[which]["ident"],
+                store=self.engines[which].setdefault("pings", {}))
+        finally:
+            peers.tailscale_peers = orig
+
+    def test_both_machines_report_the_same_link_ping(self):
+        port_a = self.srvs[0].server_address[1]
+        port_b = self.srvs[1].server_address[1]
+        # Make each machine's own measurement deterministic and asymmetric:
+        # A->B is quick (40 ms), B->A is slow (60 ms).
+        own = {port_b: 40.0, port_a: 60.0}
+        orig = peers._measure_rtt
+        peers._measure_rtt = lambda ip, port, secret, samples=3, timeout=2.0: own.get(port)
+        try:
+            self._gather(0)             # A measures B and records its number
+            b = self._gather(1)         # B measures A; A's number is now available
+            a = self._gather(0)         # A re-polls; B's number is available now
+        finally:
+            peers._measure_rtt = orig
+        a_ms = a["peers"][0]["ping_ms"]
+        b_ms = b["peers"][0]["ping_ms"]
+        self.assertEqual(a_ms, 60.0)    # the worse direction wins...
+        self.assertEqual(b_ms, 60.0)    # ...and reads the same on both machines
+        self.assertEqual(a_ms, b_ms)
+
+    def test_ping_response_reports_our_measurement_of_the_caller(self):
+        self.engines[1]["pings"] = {"127.0.0.1": 27.5}
+        port_b = self.srvs[1].server_address[1]
+        self.assertEqual(peers._peer_rtt("127.0.0.1", port_b, "s3cr3t"), 27.5)
+        self.assertIsNone(peers._peer_rtt("127.0.0.1", _free_port(), "s3cr3t"))
 
 
 class QuitGateTests(unittest.TestCase):
