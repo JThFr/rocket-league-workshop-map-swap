@@ -142,14 +142,18 @@ Each machine runs its own `rpmap` server (listening on all interfaces, gated to 
 tailnet in Tailscale mode — no `--host` needed) and shares a session code.
 The **Players** panel then shows who's online and what each has loaded, with **Switch me** /
 **Set theirs** / **Load mine on everyone** actions and an **Only maps everyone has** filter.
-In local-network mode the roster is your manually-added peers instead of the tailnet. Syncs are
-**explicit** and reference-only — no map bytes move; anything obtained outside the Steam Workshop
-syncs only if the peer already has the byte-identical file. Never swap during an online match.
+Set the **display name** others see for you right there (*Your name* → **Save**), or with
+`rpmap name "Julien"`. In local-network mode the roster is your manually-added peers instead of
+the tailnet. Syncs are **explicit** and reference-only — no map bytes move; anything obtained
+outside the Steam Workshop syncs only if the peer already has the byte-identical file. Never swap
+during an online match.
 
 Sync state is **slot-aware**: two players on the same *stock* arena count as in sync (only custom
 maps are byte-compared), so build/platform differences in the stock `.upk` don't raise a false
 mismatch. Each poll also measures the **round-trip time** to every reachable peer — the table's
 **Ping** column — and the lowest-latency node gets a **★ host** badge as the recommended host.
+Both ends of a link measure it and show the **worse** direction, so the number reads the same on
+each player's screen.
 
 ## Documentation
 

@@ -88,6 +88,24 @@ def _network_set(engine: dict, payload: dict) -> dict:
     return {"ok": True, "network": _network_status(engine)}
 
 
+def _ident_set_name(engine: dict, payload: dict) -> dict:
+    """Set (or clear) the display name peers see for this machine.
+
+    The name is a *label*, never an address: it is stored in the config so it
+    survives restarts and is served to peers via ``/api/capabilities``. Control
+    characters and stray whitespace are dropped and the length is capped, so a
+    pasted blob can't wreck the roster table.
+    """
+    raw = str(payload.get("name") or "")
+    name = "".join(ch for ch in raw if ch.isprintable()).strip()[:32]
+    cfg = engine.setdefault("cfg", {})
+    cfg["display_name"] = name or None
+    save_config(cfg)
+    ident = engine.setdefault("ident", {})
+    ident["name"] = name or ident.get("peer_id") or socket.gethostname()
+    return {"ok": True, "name": ident["name"], "display_name": name or None}
+
+
 def _peers_manual_set(engine: dict, payload: dict) -> dict:
     """Add/update or remove a manual peer (the local-network roster)."""
     cfg = engine.setdefault("cfg", {})
@@ -504,6 +522,11 @@ PAGE = r"""<!doctype html>
       <button onclick="loadPeers()">Refresh</button>
     </div>
     <div class="row" style="margin-top:10px">
+      <span class="muted">Your name</span>
+      <input class="search" id="myName" placeholder="Shown to other players" style="min-width:180px">
+      <button onclick="saveName()">Save</button>
+    </div>
+    <div class="row" style="margin-top:10px">
       <span class="muted">Session code</span>
       <code class="secret" id="mySecret">-</code>
       <button onclick="copySecret()">Copy</button>
@@ -765,8 +788,20 @@ async function loadSession(){
   catch(e){ SESSION = null; return; }
   const el = document.getElementById('mySecret');
   if(el) el.textContent = SESSION.secret || '-';
+  const nm = document.getElementById('myName');
+  if(nm && document.activeElement !== nm) nm.value = SESSION.name || '';
   const vl = document.getElementById('verLabel');
   if(vl) vl.textContent = 'v' + (SESSION.version || '?');
+}
+async function saveName(){
+  const el = document.getElementById('myName');
+  const v = ((el && el.value) || '').trim();
+  const r = await (await api('/api/name',{method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({name:v})})).json();
+  if(r.ok){
+    toast(r.display_name ? ('Name saved: ' + r.display_name) : 'Name cleared');
+    loadSession(); loadPeers();
+  } else toast('Error: ' + (r.error||'failed'));
 }
 async function copySecret(){
   if(!SESSION || !SESSION.secret) return;
@@ -794,8 +829,10 @@ function reachLabel(p){
 }
 // Latency as three bars (small -> tall): 3 filled/green < 100 ms, 2/orange
 // < 200 ms, 1/red above. Grey when we have no measurement yet. The number is
-// our round-trip to that peer; the muted "avg" is the peer's own average ping
-// to everyone (self-reported, so the recommended host is visible too).
+// the link's round-trip time - the worse of the two directions, so it reads the
+// same on this peer's screen as on ours; the muted "avg" is the peer's own
+// average ping to everyone (self-reported, so the recommended host is visible
+// too).
 function pingCell(p, isSelf){
   const ms = p.ping_ms;
   let out;
@@ -805,7 +842,7 @@ function pingCell(p, isSelf){
     const tier = ms < 100 ? 3 : ms < 200 ? 2 : 1;
     const cls = tier === 3 ? 'good' : tier === 2 ? 'ok' : 'bad';
     const bars = [1,2,3].map(n => `<i class="${n<=tier?'on':''}"></i>`).join('');
-    out = `<span class="bars ${cls}" title="${Math.round(ms)} ms to this peer">${bars}</span>`
+    out = `<span class="bars ${cls}" title="${Math.round(ms)} ms round-trip to this peer (same on both sides)">${bars}</span>`
         + `<span>${Math.round(ms)} ms</span>`;
   }
   if(isSelf) out += ' <span class="muted">(your avg)</span>';
@@ -1478,7 +1515,12 @@ def make_handler(engine: dict):
 
             if u.path == "/api/ping":
                 # Lightweight latency target: peers time a round-trip to this.
-                return self._json({"ok": True})
+                # We also hand back *our own* last measurement of the caller, so
+                # both machines can report the same (worse-of-the-two) link
+                # latency instead of two disagreeing one-way numbers.
+                own = (engine.get("pings") or {}).get(self.client_address[0])
+                return self._json({"ok": True,
+                                   "rtt": round(own, 1) if own is not None else None})
 
             if u.path == "/api/capabilities":
                 st = slot_state(cooked, slot)
@@ -1529,7 +1571,8 @@ def make_handler(engine: dict):
                 return self._json({"error": "no preview"}, 404)
 
             if u.path == "/api/peers":
-                data = gather_peers(cooked, slot, engine.get("cfg") or {}, _ident())
+                data = gather_peers(cooked, slot, engine.get("cfg") or {}, _ident(),
+                                    store=engine.setdefault("pings", {}))
                 data["manual_peers"] = (engine.get("cfg") or {}).get("manual_peers") or []
                 return self._json(data)
 
@@ -1577,6 +1620,10 @@ def make_handler(engine: dict):
                     engine.setdefault("cfg", {})["session_secret"] = new
                     save_config(engine["cfg"])
                     return self._json({"ok": True, "secret": new})
+                if u.path == "/api/name":
+                    if not self._local_ok():
+                        return self._json({"error": "local only"}, 403)
+                    return self._json(_ident_set_name(engine, payload))
                 if u.path == "/api/network":
                     if not self._local_ok():
                         return self._json({"error": "local only"}, 403)

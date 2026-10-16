@@ -120,6 +120,11 @@ python3 rpmap.py
 python3 rpmap.py peers      # text roster: who's online, what they've loaded, in-sync
 ```
 
+Set the **display name** others see for you in the UI's **Players** panel (*Your name* → **Save**),
+or with `python3 rpmap.py name "Julien"`; clearing it falls back to your machine/tailnet name.
+The name is a label only — it never affects addressing, and it is served to peers in the
+capabilities handshake.
+
 In the UI's **Players** panel: **Switch me** (load a peer's map here), **Set theirs** (load
 your map on one peer), **Load mine on everyone** (push to all reachable peers). A peer that
 doesn't have the map reports *not installed* with a Workshop link. Syncs are **explicit** and
@@ -144,7 +149,9 @@ list* (an older build). "In sync" counts only the reachable rpmap peers, and is 
 two players on the same *stock* arena count as in sync (only custom maps are byte-compared), so
 build/platform differences in the stock `.upk` don't raise a false mismatch. Each poll also
 measures the round-trip time to every reachable peer (the **Ping** column, three bars), and the
-lowest-latency node gets a **★ host** badge as the recommended host.
+lowest-latency node gets a **★ host** badge as the recommended host. Each side measures the link
+in both directions and shows the **worse** one, so a given link reads the **same** number on both
+players' screens (and the number is the conservative one).
 
 ## Native LAN discovery over Tailscale
 
